@@ -1,0 +1,89 @@
+# Copyright (C) 2026 The Android Open Source Project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Builds the Perfetto UI (including the dev.perfetto.AgentAnalysis plugin) and
+# publishes it to GitHub Pages. Runs on GitHub-hosted runners, which (unlike a
+# locked-down corporate network) can fetch the full C++/WASM toolchain from
+# *.googlesource.com, so the trace_processor WASM is compiled here.
+#
+# The published site is a fully client-side SPA: traces are parsed locally in
+# the browser via WASM and AI requests go straight from the browser to the
+# configured LLM endpoint. Nothing is proxied through GitHub.
+name: Deploy Perfetto UI to Pages
+
+on:
+  # Deploy on every push to the default branch.
+  push:
+    branches: [main]
+  # Allow manual runs from the Actions tab.
+  workflow_dispatch: {}
+
+# Permissions required by actions/deploy-pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one concurrent Pages deployment; newer pushes supersede in-flight ones.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The UI version string is derived from the CHANGELOG + git history,
+          # so we need the full history (not a shallow clone).
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install UI build dependencies
+        # Pulls the hermetic Node, pnpm, emsdk and C++/WASM toolchain.
+        run: tools/install-build-deps --ui
+
+      - name: Build UI
+        # Full production build: compiles protos, the trace_processor WASM and
+        # bundles the frontend into out/ui/ui/dist.
+        run: ui/build
+
+      - name: Disable Jekyll
+        # GitHub Pages runs Jekyll by default, which strips files/dirs starting
+        # with an underscore. Perfetto's bundles don't currently use those, but
+        # this guards against future breakage.
+        run: touch out/ui/ui/dist/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: out/ui/ui/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

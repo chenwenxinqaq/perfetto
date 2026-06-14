@@ -1,0 +1,252 @@
+// Copyright (C) 2026 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+.pf-agent-analysis {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  font-size: 13px;
+
+  &__header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--pf-color-border, rgba(0, 0, 0, 0.1));
+  }
+
+  &__title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 600;
+  }
+
+  &__spacer {
+    flex: 1;
+  }
+
+  &__model {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  &__model-label {
+    color: var(--pf-color-text-muted, #666);
+  }
+
+  &__model-select {
+    min-width: 160px;
+  }
+
+  // ---- Transcript ---------------------------------------------------------
+
+  &__transcript {
+    flex: 1;
+    min-height: 120px;
+    overflow-y: auto;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    scroll-behavior: smooth;
+  }
+
+  &__empty {
+    margin: auto;
+    text-align: center;
+    color: var(--pf-color-text-muted, #777);
+    max-width: 420px;
+  }
+
+  &__hint {
+    font-size: 12px;
+    opacity: 0.8;
+  }
+
+  &__msg {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+
+    &--user {
+      flex-direction: row-reverse;
+    }
+  }
+
+  &__avatar {
+    flex: 0 0 auto;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 16px;
+
+    .pf-agent-analysis__msg--assistant & {
+      background: var(--pf-color-primary, #3367d6);
+    }
+    .pf-agent-analysis__msg--user & {
+      background: var(--pf-color-text-muted, #888);
+    }
+  }
+
+  &__bubble {
+    max-width: 80%;
+    padding: 8px 12px;
+    border-radius: 12px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+
+    .pf-agent-analysis__msg--assistant & {
+      background: var(--pf-color-surface-alt, rgba(120, 120, 120, 0.12));
+      border-top-left-radius: 3px;
+    }
+    .pf-agent-analysis__msg--user & {
+      background: var(--pf-color-primary, #3367d6);
+      color: #fff;
+      border-top-right-radius: 3px;
+    }
+
+    &--error {
+      background: var(--pf-color-danger, #c5221f) !important;
+      color: #fff !important;
+    }
+  }
+
+  &__user-text {
+    white-space: pre-wrap;
+  }
+
+  // Markdown content rendered inside assistant bubbles.
+  &__md {
+    p {
+      margin: 0 0 8px;
+    }
+    p:last-child {
+      margin-bottom: 0;
+    }
+    pre {
+      background: rgba(0, 0, 0, 0.35);
+      color: #f1f1f1;
+      padding: 8px;
+      border-radius: 6px;
+      overflow-x: auto;
+      font-size: 12px;
+    }
+    code {
+      font-family: var(--pf-font-mono, monospace);
+    }
+    ul,
+    ol {
+      margin: 4px 0 8px;
+      padding-left: 20px;
+    }
+    table {
+      border-collapse: collapse;
+      margin: 4px 0;
+    }
+    th,
+    td {
+      border: 1px solid rgba(120, 120, 120, 0.4);
+      padding: 3px 7px;
+    }
+  }
+
+  &__typing {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--pf-color-text-muted, #777);
+  }
+
+  // ---- Composer -----------------------------------------------------------
+
+  &__composer {
+    border-top: 1px solid var(--pf-color-border, rgba(0, 0, 0, 0.1));
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  &__pending-chips,
+  &__msg-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  &__msg-chips {
+    margin-bottom: 6px;
+  }
+
+  &__chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: var(--pf-color-primary-faint, rgba(51, 103, 214, 0.15));
+    color: var(--pf-color-primary, #3367d6);
+    border: 1px solid var(--pf-color-primary, #3367d6);
+
+    .pf-icon {
+      font-size: 14px;
+    }
+
+    &--static {
+      background: rgba(255, 255, 255, 0.18);
+      color: inherit;
+      border-color: transparent;
+    }
+  }
+
+  &__chip-remove {
+    cursor: pointer;
+    border-radius: 50%;
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.15);
+    }
+  }
+
+  &__input-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+  }
+
+  &__input {
+    flex: 1;
+    min-width: 0;
+    resize: none;
+    max-height: 120px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--pf-color-border, rgba(0, 0, 0, 0.2));
+    font: inherit;
+    line-height: 1.4;
+  }
+
+  &--missing-token {
+    max-width: 720px;
+    padding: 16px;
+  }
+}
