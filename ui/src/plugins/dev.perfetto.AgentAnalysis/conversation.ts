@@ -22,6 +22,10 @@ import type {duration, time} from '../../base/time';
 import type {AreaSelection} from '../../public/selection';
 import type {Engine} from '../../trace_processor/engine';
 import {buildSelectionContext} from './context_builder';
+import type {
+  ConversationHistoryStore,
+  SavedConversation,
+} from './history_store';
 import type {LlmClient, LlmMessage} from './llm_client';
 
 // A trace region the user attached to their next message, shown as a chip.
@@ -35,7 +39,7 @@ export interface SelectionChip {
 export interface Turn {
   readonly role: 'user' | 'assistant';
   text: string; // Display text (also streamed into for assistant turns).
-  readonly chips?: ReadonlyArray<SelectionChip>; // Attached to user turns.
+  chips?: ReadonlyArray<{readonly id: string; readonly label: string}>;
   llmContent?: string; // What is actually sent to the LLM (may include SQL).
   isError?: boolean;
 }
@@ -45,6 +49,12 @@ export interface ConversationDeps {
   client: LlmClient;
   readonly traceStart: time;
   readonly resolveTrackName: (uri: string) => string;
+  readonly store: ConversationHistoryStore;
+}
+
+let convSeq = 0;
+function newConversationId(): string {
+  return `c-${Date.now().toString(36)}-${(convSeq++).toString(36)}`;
 }
 
 export class Conversation {
@@ -52,6 +62,8 @@ export class Conversation {
   pending: SelectionChip[] = [];
   input = '';
   isLoading = false;
+  id = newConversationId();
+  private createdAt = Date.now();
   private abort?: AbortController;
   private lastNotedId?: string;
 
@@ -65,6 +77,14 @@ export class Conversation {
 
   get client(): LlmClient {
     return this.deps.client;
+  }
+
+  // A short title derived from the first user message (for the history list).
+  get title(): string {
+    const firstUser = this.turns.find((t) => t.role === 'user');
+    const raw = firstUser?.text.trim() ?? '';
+    if (raw === '') return 'New chat';
+    return raw.length > 40 ? `${raw.slice(0, 40)}…` : raw;
   }
 
   // Records the currently-selected area as a pending chip (deduped). Called by
@@ -90,10 +110,67 @@ export class Conversation {
     this.input = '';
     this.isLoading = false;
     this.lastNotedId = undefined;
+    // Start a fresh conversation id/timestamp; the previous one is already
+    // persisted (send() upserts after every turn).
+    this.id = newConversationId();
+    this.createdAt = Date.now();
   }
 
   dispose(): void {
     this.abort?.abort();
+  }
+
+  // ---- History (persisted per-trace) -------------------------------------
+
+  history(): SavedConversation[] {
+    return this.deps.store.list();
+  }
+
+  // Restores a saved conversation into the live transcript.
+  switchTo(id: string): void {
+    const saved = this.deps.store.get(id);
+    if (saved === undefined) return;
+    this.abort?.abort();
+    this.isLoading = false;
+    this.pending = [];
+    this.input = '';
+    this.lastNotedId = undefined;
+    this.id = saved.id;
+    this.createdAt = saved.createdAt;
+    this.turns.length = 0;
+    for (const t of saved.turns) {
+      this.turns.push({
+        role: t.role,
+        text: t.text,
+        isError: t.isError,
+        chips: t.chips?.map((c, i) => ({id: `saved-${i}`, label: c.label})),
+      });
+    }
+    m.redraw();
+  }
+
+  deleteSaved(id: string): void {
+    this.deps.store.remove(id);
+    if (id === this.id) this.newChat();
+    m.redraw();
+  }
+
+  // Serialises the current transcript for persistence (drops live AreaSelection
+  // references and the SQL-laden llmContent; keeps only display data).
+  private persist(): void {
+    if (this.turns.length === 0) return;
+    this.deps.store.upsert({
+      id: this.id,
+      title: this.title,
+      createdAt: this.createdAt,
+      updatedAt: Date.now(),
+      turns: this.turns.map((t) => ({
+        role: t.role,
+        text: t.text,
+        isError: t.isError,
+        chips: t.chips?.map((c) => ({label: c.label})),
+      })),
+    });
   }
 
   // Sends the user's current input (plus any attached selection chips) and
@@ -158,6 +235,7 @@ export class Conversation {
       }
     } finally {
       this.isLoading = false;
+      this.persist();
       m.redraw();
     }
   }

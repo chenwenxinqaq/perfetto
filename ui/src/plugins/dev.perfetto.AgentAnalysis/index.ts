@@ -18,12 +18,14 @@ import m from 'mithril';
 import {z} from 'zod';
 import type {App} from '../../public/app';
 import type {PerfettoPlugin} from '../../public/plugin';
+import type {AreaSelection} from '../../public/selection';
 import type {Setting} from '../../public/settings';
 import type {Trace} from '../../public/trace';
 import {Button, ButtonVariant} from '../../widgets/button';
 import {Intent} from '../../widgets/common';
 import {AnalysisPanel} from './analysis_panel';
 import {Conversation} from './conversation';
+import {ConversationHistoryStore} from './history_store';
 import {LlmClient} from './llm_client';
 
 const DEFAULT_SYSTEM_PROMPT = `You are an expert Perfetto trace analyst.
@@ -87,7 +89,7 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
       });
 
     // One conversation per trace, so history survives selection changes and
-    // panel remounts.
+    // panel remounts. Saved conversations are keyed by the trace uuid.
     const conversation = new Conversation({
       engine: trace.engine,
       client: makeClient(),
@@ -95,51 +97,67 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
       resolveTrackName: (uri) =>
         trace.workspaces.currentWorkspace.flatTracks.find((t) => t.uri === uri)
           ?.name ?? uri,
+      store: new ConversationHistoryStore(trace.traceInfo.uuid),
     });
     trace.trash.defer(() => conversation.dispose());
 
+    // Renders either the missing-token prompt or the chat panel. `selection`
+    // is undefined when hosted as a standalone page (sidebar entry).
+    const renderContent = (selection?: AreaSelection): m.Children => {
+      if (AgentAnalysisPlugin.tokenSetting.get() === '') {
+        return m(
+          '.pf-agent-analysis.pf-agent-analysis--missing-token',
+          m('h3', 'AI Analysis'),
+          m(
+            'p',
+            'Set the Agent Analysis API token in settings before sending ' +
+              'selected trace summaries to an external LLM.',
+          ),
+          m(Button, {
+            label: 'Open settings',
+            icon: 'settings',
+            intent: Intent.Primary,
+            variant: ButtonVariant.Filled,
+            onclick: () => {
+              window.location.hash = '#!/settings';
+            },
+          }),
+        );
+      }
+      // Pick up live edits to endpoint/token/prompt.
+      conversation.refreshClient(makeClient());
+      return m(AnalysisPanel, {
+        client: conversation.client,
+        selection,
+        modelSetting: AgentAnalysisPlugin.modelSetting,
+        conversation,
+      });
+    };
+
+    // Entry point 1: a tab in the timeline area-selection drawer.
     trace.selection.registerAreaSelectionTab({
       id: 'agent_analysis',
       name: 'AI Analysis',
       priority: 100,
-      render: (selection) => {
-        const apiKey = AgentAnalysisPlugin.tokenSetting.get();
-        if (apiKey === '') {
-          return {
-            isLoading: false,
-            content: m(
-              '.pf-agent-analysis.pf-agent-analysis--missing-token',
-              m('h3', 'AI Analysis'),
-              m(
-                'p',
-                'Set the Agent Analysis API token in settings before sending selected trace summaries to an external LLM.',
-              ),
-              m(Button, {
-                label: 'Open settings',
-                icon: 'settings',
-                intent: Intent.Primary,
-                variant: ButtonVariant.Filled,
-                onclick: () => {
-                  window.location.hash = '#!/settings';
-                },
-              }),
-            ),
-          };
-        }
+      render: (selection) => ({
+        isLoading: false,
+        content: renderContent(selection),
+      }),
+    });
 
-        // Pick up live edits to endpoint/token/prompt.
-        conversation.refreshClient(makeClient());
+    // Entry point 2: a standalone page reachable even with nothing selected.
+    trace.pages.registerPage({
+      route: '/agent_analysis',
+      render: () => m('.pf-agent-analysis-page', renderContent(undefined)),
+    });
 
-        return {
-          isLoading: false,
-          content: m(AnalysisPanel, {
-            client: conversation.client,
-            selection,
-            modelSetting: AgentAnalysisPlugin.modelSetting,
-            conversation,
-          }),
-        };
-      },
+    // Sidebar shortcut to the standalone page.
+    trace.sidebar.addMenuItem({
+      section: 'current_trace',
+      text: 'AI Analysis',
+      href: '#!/agent_analysis',
+      icon: 'smart_toy',
+      sortOrder: 10,
     });
   }
 }

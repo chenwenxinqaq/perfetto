@@ -17,6 +17,7 @@ import markdownit from 'markdown-it';
 import {Button, ButtonVariant} from '../../widgets/button';
 import {Icon} from '../../widgets/icon';
 import {Intent} from '../../widgets/common';
+import {Popup, PopupPosition} from '../../widgets/popup';
 import {Select} from '../../widgets/select';
 import {Spinner} from '../../widgets/spinner';
 import type {AreaSelection} from '../../public/selection';
@@ -26,9 +27,23 @@ import type {LlmClient} from './llm_client';
 
 export interface AnalysisPanelAttrs {
   readonly client: LlmClient;
-  readonly selection: AreaSelection;
+  // The current area selection, if the panel is hosted in the selection tab.
+  // Undefined when opened as a standalone page (sidebar / no selection).
+  readonly selection?: AreaSelection;
   readonly modelSetting: Setting<string>;
   readonly conversation: Conversation;
+}
+
+// Formats a past timestamp as a compact relative string ("5 min ago").
+function timeAgo(ts: number): string {
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  const d = Math.floor(h / 24);
+  return `${d} day${d === 1 ? '' : 's'} ago`;
 }
 
 // Chat-style panel for the AI Analysis tab. The transcript lives in the
@@ -41,14 +56,18 @@ export class AnalysisPanel implements m.ClassComponent<AnalysisPanelAttrs> {
   private autoScroll = true;
 
   oncreate({attrs}: m.CVnode<AnalysisPanelAttrs>): void {
-    attrs.conversation.noteSelection(attrs.selection);
+    if (attrs.selection !== undefined) {
+      attrs.conversation.noteSelection(attrs.selection);
+    }
     this.loadModels(attrs);
   }
 
   onupdate({attrs}: m.CVnode<AnalysisPanelAttrs>): void {
     // Attach the (possibly new) selection as a pending chip, without wiping
-    // the existing conversation.
-    attrs.conversation.noteSelection(attrs.selection);
+    // the existing conversation. No-op on the standalone page (no selection).
+    if (attrs.selection !== undefined) {
+      attrs.conversation.noteSelection(attrs.selection);
+    }
   }
 
   private async loadModels(attrs: AnalysisPanelAttrs): Promise<void> {
@@ -112,6 +131,7 @@ export class AnalysisPanel implements m.ClassComponent<AnalysisPanelAttrs> {
         ),
         !this.modelsLoaded && m(Spinner, {easing: true}),
       ),
+      this.renderHistoryMenu(conversation),
       m(Button, {
         icon: 'add_comment',
         label: 'New chat',
@@ -121,6 +141,56 @@ export class AnalysisPanel implements m.ClassComponent<AnalysisPanelAttrs> {
           this.autoScroll = true;
         },
       }),
+    );
+  }
+
+  private renderHistoryMenu(conversation: Conversation): m.Children {
+    const saved = conversation.history();
+    return m(
+      Popup,
+      {
+        position: PopupPosition.BottomEnd,
+        trigger: m(Button, {
+          icon: 'history',
+          title: 'Conversation history',
+        }),
+      },
+      m(
+        '.pf-agent-analysis__history',
+        saved.length === 0
+          ? m(
+              '.pf-agent-analysis__history-empty',
+              'No saved conversations yet.',
+            )
+          : saved.map((c) =>
+              m(
+                '.pf-agent-analysis__history-item' +
+                  (c.id === conversation.id
+                    ? '.pf-agent-analysis__history-item--current'
+                    : ''),
+                {key: c.id},
+                // Only the text area carries the dismiss class, so restoring a
+                // conversation closes the popup but deleting keeps it open.
+                m(
+                  '.pf-agent-analysis__history-text.' +
+                    Popup.DISMISS_POPUP_GROUP_CLASS,
+                  {
+                    onclick: () => {
+                      conversation.switchTo(c.id);
+                      this.autoScroll = true;
+                    },
+                  },
+                  m('.pf-agent-analysis__history-title', c.title),
+                  m('.pf-agent-analysis__history-time', timeAgo(c.updatedAt)),
+                ),
+                m(Icon, {
+                  icon: 'delete',
+                  className: 'pf-agent-analysis__history-delete',
+                  onclick: () => conversation.deleteSaved(c.id),
+                }),
+              ),
+            ),
+      ),
     );
   }
 

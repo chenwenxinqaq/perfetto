@@ -48,6 +48,9 @@ test.beforeAll(async ({browser}, testInfo) => {
   // Seed localStorage before any app script runs, on every navigation.
   await page.addInitScript(
     (args) => {
+      // Start from a clean conversation-history store so re-runs are
+      // deterministic (this test asserts exact history counts).
+      localStorage.removeItem('dev.perfetto.AgentAnalysis.history');
       localStorage.setItem(
         'perfettoFeatureFlags',
         JSON.stringify({
@@ -170,4 +173,59 @@ test('AI Analysis tab streams a mocked analysis for an area selection', async ()
   await page.getByRole('button', {name: 'New chat'}).click();
   await pth.waitForPerfettoIdle();
   await expect(transcript.locator('.pf-agent-analysis__msg')).toHaveCount(0);
+
+  // The previous conversation is archived in the history popup. Open it.
+  const historyBtn = page.locator('button[title="Conversation history"]');
+  await historyBtn.click();
+  const historyItems = page.locator('.pf-agent-analysis__history-item');
+  await expect(historyItems).toHaveCount(1);
+  await expect(historyItems.first()).toContainText('What happened here?');
+
+  // Clicking a history item restores its transcript.
+  await historyItems.first().click();
+  await pth.waitForPerfettoIdle();
+  await expect(
+    transcript.locator('.pf-agent-analysis__msg--user').first(),
+  ).toContainText('What happened here?');
+  await expect(
+    transcript.locator('.pf-agent-analysis__msg--assistant'),
+  ).toHaveCount(2);
+
+  // Deleting from the history popup removes it from the list.
+  await historyBtn.click();
+  await page
+    .locator('.pf-agent-analysis__history-item')
+    .first()
+    .locator('.pf-agent-analysis__history-delete')
+    .click();
+  await pth.waitForPerfettoIdle();
+  await expect(page.locator('.pf-agent-analysis__history-empty')).toBeVisible();
+});
+
+test('AI Analysis opens as a standalone page with no selection', async () => {
+  // Clear any selection, then navigate to the standalone page (the same route
+  // the sidebar entry points at). The chat panel must render without requiring
+  // a timeline selection.
+  await page.evaluate(() => self.app.trace!.selection.clearSelection());
+  await pth.navigate('#!/agent_analysis');
+  await pth.waitForPerfettoIdle();
+
+  const panel = page.locator('.pf-agent-analysis-page .pf-agent-analysis');
+  await expect(panel).toBeVisible();
+
+  // Start a clean chat on the standalone page (drops any chip/turns carried
+  // over from the shared per-trace conversation).
+  await page.getByRole('button', {name: 'New chat'}).click();
+  await pth.waitForPerfettoIdle();
+
+  // Pick a known-good model explicitly so this test is order-independent.
+  await page
+    .locator('.pf-agent-analysis__model-select')
+    .selectOption('gpt-5.5');
+  await page.locator('.pf-agent-analysis__input').fill('Summarize this trace.');
+  await page.locator('button[title="Send (Enter)"]').click();
+
+  const assistant = page.locator('.pf-agent-analysis__msg--assistant');
+  await expect(assistant).toContainText(MARKER, {timeout: 15_000});
+  await expect(assistant).toContainText('model=gpt-5.5');
 });
