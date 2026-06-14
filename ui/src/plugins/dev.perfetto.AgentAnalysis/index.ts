@@ -1,0 +1,145 @@
+// Copyright (C) 2026 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import './styles.scss';
+
+import m from 'mithril';
+import {z} from 'zod';
+import type {App} from '../../public/app';
+import type {PerfettoPlugin} from '../../public/plugin';
+import type {Setting} from '../../public/settings';
+import type {Trace} from '../../public/trace';
+import {Button, ButtonVariant} from '../../widgets/button';
+import {Intent} from '../../widgets/common';
+import {AnalysisPanel} from './analysis_panel';
+import {Conversation} from './conversation';
+import {LlmClient} from './llm_client';
+
+const DEFAULT_SYSTEM_PROMPT = `You are an expert Perfetto trace analyst.
+Given a selected time range and compact SQL summaries, explain what happened,
+call out suspicious performance issues, and suggest concrete next queries or UI
+checks. Be concise and avoid inventing facts not supported by the data.`;
+
+export default class AgentAnalysisPlugin implements PerfettoPlugin {
+  static readonly id = 'dev.perfetto.AgentAnalysis';
+  static readonly description =
+    'Adds an AI Analysis tab for selected timeline ranges.';
+
+  static endpointSetting: Setting<string>;
+  static tokenSetting: Setting<string>;
+  static modelSetting: Setting<string>;
+  static promptSetting: Setting<string>;
+
+  static onActivate(app: App): void {
+    AgentAnalysisPlugin.endpointSetting = app.settings.register({
+      id: `${AgentAnalysisPlugin.id}#Endpoint`,
+      name: 'Agent Analysis API endpoint',
+      description:
+        'OpenAI-compatible chat completions endpoint. Defaults to the Baidu ' +
+        'OneAPI gateway (https://oneapi-comate.baidu-int.com/v1/chat/completions).',
+      schema: z.string(),
+      defaultValue: 'https://oneapi-comate.baidu-int.com/v1/chat/completions',
+    });
+
+    AgentAnalysisPlugin.tokenSetting = app.settings.register({
+      id: `${AgentAnalysisPlugin.id}#Token`,
+      name: 'Agent Analysis API token',
+      description: 'Bearer token for the configured LLM endpoint.',
+      schema: z.string(),
+      defaultValue: '',
+    });
+
+    AgentAnalysisPlugin.modelSetting = app.settings.register({
+      id: `${AgentAnalysisPlugin.id}#Model`,
+      name: 'Agent Analysis model',
+      description:
+        'Default model. Can also be switched live from the AI Analysis panel.',
+      schema: z.string(),
+      defaultValue: 'Claude Sonnet 4.6',
+    });
+
+    AgentAnalysisPlugin.promptSetting = app.settings.register({
+      id: `${AgentAnalysisPlugin.id}#SystemPrompt`,
+      name: 'Agent Analysis system prompt',
+      description: 'System prompt used by the AI trace analyst.',
+      schema: z.string(),
+      defaultValue: DEFAULT_SYSTEM_PROMPT,
+    });
+  }
+
+  async onTraceLoad(trace: Trace): Promise<void> {
+    const makeClient = () =>
+      new LlmClient({
+        endpoint: AgentAnalysisPlugin.endpointSetting.get(),
+        apiKey: AgentAnalysisPlugin.tokenSetting.get(),
+        systemPrompt: AgentAnalysisPlugin.promptSetting.get(),
+      });
+
+    // One conversation per trace, so history survives selection changes and
+    // panel remounts.
+    const conversation = new Conversation({
+      engine: trace.engine,
+      client: makeClient(),
+      traceStart: trace.traceInfo.start,
+      resolveTrackName: (uri) =>
+        trace.workspaces.currentWorkspace.flatTracks.find((t) => t.uri === uri)
+          ?.name ?? uri,
+    });
+    trace.trash.defer(() => conversation.dispose());
+
+    trace.selection.registerAreaSelectionTab({
+      id: 'agent_analysis',
+      name: 'AI Analysis',
+      priority: 100,
+      render: (selection) => {
+        const apiKey = AgentAnalysisPlugin.tokenSetting.get();
+        if (apiKey === '') {
+          return {
+            isLoading: false,
+            content: m(
+              '.pf-agent-analysis.pf-agent-analysis--missing-token',
+              m('h3', 'AI Analysis'),
+              m(
+                'p',
+                'Set the Agent Analysis API token in settings before sending selected trace summaries to an external LLM.',
+              ),
+              m(Button, {
+                label: 'Open settings',
+                icon: 'settings',
+                intent: Intent.Primary,
+                variant: ButtonVariant.Filled,
+                onclick: () => {
+                  window.location.hash = '#!/settings';
+                },
+              }),
+            ),
+          };
+        }
+
+        // Pick up live edits to endpoint/token/prompt.
+        conversation.refreshClient(makeClient());
+
+        return {
+          isLoading: false,
+          content: m(AnalysisPanel, {
+            client: conversation.client,
+            selection,
+            modelSetting: AgentAnalysisPlugin.modelSetting,
+            conversation,
+          }),
+        };
+      },
+    });
+  }
+}
