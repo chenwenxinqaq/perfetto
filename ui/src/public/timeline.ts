@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import type {HighPrecisionTimeSpan} from '../base/high_precision_time_span';
-import type {time} from '../base/time';
+import type {time, duration} from '../base/time';
 import type {Setting} from './settings';
 
 export enum TimestampFormat {
@@ -208,6 +208,18 @@ export interface Timeline {
 
   hoveredUtid: number | undefined;
   hoveredPid: bigint | undefined;
+
+  // ---- Cross-trace timeline alignment ----
+  // Returns the constant time offset applied to a machine's tracks (by
+  // machine_id), or undefined if it has none. All tracks of that machine are
+  // rendered and queried shifted by this duration.
+  machineTimeOffset(machineId: number): duration | undefined;
+  // Sets (or clears, when 0n) the alignment offset for a machine.
+  setMachineTimeOffset(machineId: number, offset: duration): void;
+  // Whether any machine currently has an alignment offset.
+  readonly hasTimeAlignment: boolean;
+  // Removes all alignment offsets.
+  clearTimeAlignment(): void;
 
   // This value defines the time of the origin of the time axis in trace time.
   // Depending on the timestamp format setting, this value can change:

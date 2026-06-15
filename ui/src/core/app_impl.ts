@@ -218,8 +218,15 @@ export class AppImpl implements App {
     return this.openTrace({type: 'FILE', file});
   }
 
-  openTraceFromMultipleFiles(files: ReadonlyArray<File>) {
-    return this.openTrace({type: 'MULTIPLE_FILES', files});
+  openTraceFromMultipleFiles(
+    files: ReadonlyArray<File>,
+    opts?: {separateMachines?: boolean},
+  ) {
+    return this.openTrace({
+      type: 'MULTIPLE_FILES',
+      files,
+      separateMachines: opts?.separateMachines,
+    });
   }
 
   openTraceFromUrl(url: string, serializedAppState?: SerializedAppState) {

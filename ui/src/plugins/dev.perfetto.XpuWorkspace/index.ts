@@ -42,6 +42,7 @@ const WORKSPACE_TITLE = 'By XPU Device';
 interface DeviceProcess {
   readonly upid: number;
   readonly pid: number;
+  readonly machine: number;
   readonly device: number;
   readonly role: 'xpu_hw' | 'cpu_dispatch';
   readonly processName: string | null;
@@ -73,6 +74,7 @@ export default class XpuWorkspacePlugin implements PerfettoPlugin {
       SELECT
         p.upid AS upid,
         p.pid AS pid,
+        p.machine_id AS machine_id,
         p.name AS process_name,
         d.device AS device,
         CASE
@@ -102,6 +104,49 @@ export default class XpuWorkspacePlugin implements PerfettoPlugin {
     const groups = trace.plugins.getPlugin(ProcessThreadGroupsPlugin);
     const ws = trace.workspaces.createEmptyWorkspace(WORKSPACE_TITLE);
 
+    // When several traces are loaded together (e.g. for comparison) each gets
+    // its own machine_id. Group by machine first so different traces' "device
+    // N" stay in separate groups (and can still be aligned independently);
+    // within a machine, group by device so the HW and its CPU dispatch sit
+    // adjacently. With a single trace there's just one machine, so this
+    // collapses to the plain per-device grouping.
+    const machineCount = new Set(procs.map((p) => p.machine)).size;
+
+    const byMachine = new Map<number, DeviceProcess[]>();
+    for (const p of procs) {
+      const list = byMachine.get(p.machine) ?? [];
+      list.push(p);
+      byMachine.set(p.machine, list);
+    }
+
+    for (const machine of [...byMachine.keys()].sort((a, b) => a - b)) {
+      // With multiple traces, wrap each machine's devices in a labelled group
+      // so the user can tell the traces apart. With one trace, add the device
+      // groups straight to the workspace root.
+      let machineParent: TrackNode;
+      if (machineCount > 1) {
+        machineParent = new TrackNode({
+          name: `Trace (machine ${machine})`,
+          isSummary: true,
+          collapsed: false,
+        });
+        ws.addChildLast(machineParent);
+      } else {
+        machineParent = ws.tracks;
+      }
+      this.addDeviceGroups(byMachine.get(machine)!, machineParent, groups);
+    }
+
+    trace.workspaces.switchWorkspace(ws);
+  }
+
+  // Builds the per-device groups (HW process + its CPU dispatch, adjacent) for
+  // one machine's processes and appends them under `parent`.
+  private addDeviceGroups(
+    procs: ReadonlyArray<DeviceProcess>,
+    parent: TrackNode,
+    groups: InstanceType<typeof ProcessThreadGroupsPlugin>,
+  ): void {
     // Group processes by device, ordered by device index.
     const byDevice = new Map<number, DeviceProcess[]>();
     for (const p of procs) {
@@ -116,7 +161,7 @@ export default class XpuWorkspacePlugin implements PerfettoPlugin {
         isSummary: true,
         collapsed: false,
       });
-      ws.addChildLast(deviceGroup);
+      parent.addChildLast(deviceGroup);
 
       // HW process(es) first, then the CPU dispatch process, so the
       // controller sits right below the hardware it drives.
@@ -135,21 +180,21 @@ export default class XpuWorkspacePlugin implements PerfettoPlugin {
         deviceGroup.addChildLast(clone);
       }
     }
-
-    trace.workspaces.switchWorkspace(ws);
   }
 
   // Returns one row per (process, device) that carries device-tagged slices.
   private async queryDeviceProcesses(trace: Trace): Promise<DeviceProcess[]> {
     const res = await trace.engine.query(`
-      SELECT upid, pid, device, role, process_name
+      SELECT upid, pid, coalesce(machine_id, 0) AS machine, device, role,
+             process_name
       FROM xpu_device_map
-      ORDER BY device, role
+      ORDER BY machine, device, role
     `);
     const out: DeviceProcess[] = [];
     const it = res.iter({
       upid: NUM,
       pid: NUM,
+      machine: NUM,
       device: NUM,
       role: STR_NULL,
       process_name: STR_NULL,
@@ -159,6 +204,7 @@ export default class XpuWorkspacePlugin implements PerfettoPlugin {
       out.push({
         upid: it.upid,
         pid: it.pid,
+        machine: it.machine,
         device: it.device,
         role,
         processName: it.process_name,

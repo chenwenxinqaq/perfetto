@@ -19,6 +19,7 @@ import {DisposableStack} from '../../base/disposable_stack';
 import {toHTMLElement} from '../../base/dom_utils';
 import type {Rect2D} from '../../base/geom';
 import {TimeScale} from '../../base/time_scale';
+import {NUM} from '../../trace_processor/query_result';
 import {AppImpl} from '../../core/app_impl';
 import {raf} from '../../core/raf_scheduler';
 import type {TraceImpl} from '../../core/trace_impl';
@@ -32,6 +33,7 @@ import {Minimap} from './minimap';
 import {TabPanel} from './tab_panel';
 import {TimelineHeader} from './timeline_header';
 import {TrackTreeView} from './track_tree_view';
+import {getAlignmentController, TraceAlignmentOverlay} from './trace_alignment';
 import {
   DEFAULT_TRACK_MIN_HEIGHT_PX,
   MINIMUM_TRACK_MIN_HEIGHT_PX,
@@ -85,6 +87,44 @@ export default class TimelinePlugin implements PerfettoPlugin {
       text: 'Timeline',
       href: '#!/viewer',
       icon: 'line_style',
+    });
+
+    // Manual cross-trace timeline alignment (used by the diff workflow). The
+    // controller is shared with the toolbar's Align button; the overlay drives
+    // anchor capture each frame and draws the alignment guide line.
+    const alignment = getAlignmentController(trace);
+    trace.tracks.registerOverlay(new TraceAlignmentOverlay(alignment));
+
+    // Precompute upid/utid -> machine_id so alignment can shift a whole trace
+    // (machine_id is not carried on track tags). Only meaningful when several
+    // traces are loaded together (each gets its own machine_id).
+    trace.onTraceReady.addListener(async () => {
+      const upidToMachine = new Map<number, number>();
+      const utidToMachine = new Map<number, number>();
+      const pr = await trace.engine.query(
+        'SELECT upid, machine_id AS m FROM process WHERE machine_id IS NOT NULL',
+      );
+      for (const it = pr.iter({upid: NUM, m: NUM}); it.valid(); it.next()) {
+        upidToMachine.set(it.upid, it.m);
+      }
+      const tr = await trace.engine.query(
+        'SELECT utid, machine_id AS m FROM thread WHERE machine_id IS NOT NULL',
+      );
+      for (const it = tr.iter({utid: NUM, m: NUM}); it.valid(); it.next()) {
+        utidToMachine.set(it.utid, it.m);
+      }
+      trace.timeline.setMachineMaps(upidToMachine, utidToMachine);
+    });
+
+    trace.commands.registerCommand({
+      id: 'dev.perfetto.Timeline#AlignTraces',
+      name: 'Timeline: Align traces (then click two kernels)',
+      callback: () => alignment.enter(),
+    });
+    trace.commands.registerCommand({
+      id: 'dev.perfetto.Timeline#ResetTraceAlignment',
+      name: 'Timeline: Reset trace alignment',
+      callback: () => alignment.reset(),
     });
   }
 }

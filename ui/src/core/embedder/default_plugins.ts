@@ -94,6 +94,7 @@ export const defaultPlugins = [
   'dev.perfetto.Thread',
   'dev.perfetto.Timeline',
   'dev.perfetto.TimelineSync',
+  'dev.perfetto.TraceDiff',
   'dev.perfetto.TraceInfoPage',
   'dev.perfetto.TraceMetadata',
   'dev.perfetto.TraceProcessorTrack',

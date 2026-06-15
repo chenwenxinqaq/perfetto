@@ -15,7 +15,7 @@
 import {HighPrecisionTimeSpan} from '../base/high_precision_time_span';
 import {HighPrecisionTime} from '../base/high_precision_time';
 import {assertUnreachable} from '../base/assert';
-import {Time, type time, timezoneOffsetMap} from '../base/time';
+import {Time, type time, type duration, timezoneOffsetMap} from '../base/time';
 import type {Setting} from '../public/settings';
 import {
   type DurationPrecision,
@@ -52,6 +52,33 @@ export class TimelineImpl implements Timeline {
   private _hoveredUtid?: number;
   private _hoveredPid?: bigint;
 
+  // Per-machine constant time offset for manual cross-trace timeline
+  // alignment. Keyed by machine_id; all tracks of that machine are rendered
+  // (and queried) shifted by this duration. See trace_alignment.ts.
+  private readonly _machineTimeOffsets = new Map<number, duration>();
+
+  // Resolves a process/thread to its machine_id, populated once at trace load
+  // (machine_id isn't carried on track tags). Used to apply alignment offsets.
+  private _upidToMachine = new Map<number, number>();
+  private _utidToMachine = new Map<number, number>();
+
+  // Installs the upid/utid -> machine_id lookups used for alignment.
+  setMachineMaps(
+    upidToMachine: Map<number, number>,
+    utidToMachine: Map<number, number>,
+  ): void {
+    this._upidToMachine = upidToMachine;
+    this._utidToMachine = utidToMachine;
+  }
+
+  machineForUpid(upid: number): number | undefined {
+    return this._upidToMachine.get(upid);
+  }
+
+  machineForUtid(utid: number): number | undefined {
+    return this._utidToMachine.get(utid);
+  }
+
   // This is used to mark the timeline of the area that is currently being
   // selected.
   //
@@ -67,6 +94,40 @@ export class TimelineImpl implements Timeline {
   set highlightedSliceId(x) {
     if (this._highlightedSliceId === x) return;
     this._highlightedSliceId = x;
+    raf.scheduleCanvasRedraw();
+  }
+
+  // ---- Cross-trace timeline alignment ------------------------------------
+  //
+  // Offsets are keyed by machine_id, so aligning shifts an ENTIRE trace (all
+  // tracks of that machine) at once — used to line up two traces loaded
+  // together for comparison. See trace_alignment.ts.
+
+  // Returns the time offset applied to a machine's tracks, or undefined.
+  machineTimeOffset(machineId: number): duration | undefined {
+    return this._machineTimeOffsets.get(machineId);
+  }
+
+  // Shifts every track of the given machine by `offset` (added to each event's
+  // ts at render/query time). Pass 0n to clear just this machine.
+  setMachineTimeOffset(machineId: number, offset: duration): void {
+    if (offset === 0n) {
+      this._machineTimeOffsets.delete(machineId);
+    } else {
+      this._machineTimeOffsets.set(machineId, offset);
+    }
+    raf.scheduleCanvasRedraw();
+  }
+
+  // Whether any machine currently has an alignment offset.
+  get hasTimeAlignment(): boolean {
+    return this._machineTimeOffsets.size > 0;
+  }
+
+  // Removes all alignment offsets, restoring the unshifted timeline.
+  clearTimeAlignment(): void {
+    if (this._machineTimeOffsets.size === 0) return;
+    this._machineTimeOffsets.clear();
     raf.scheduleCanvasRedraw();
   }
 

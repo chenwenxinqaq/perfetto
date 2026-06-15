@@ -306,13 +306,19 @@ export class TrackView {
       offsetY: trackRect.top,
     });
 
-    const timescale = new TimeScale(visibleWindow, {
+    // Apply any cross-trace alignment offset for this track's group, by
+    // shifting the window it sees. Because the track derives BOTH its SQL
+    // query window and its render timescale from this same window, the data
+    // and pixels shift together automatically.
+    const alignedWindow = this.applyAlignmentOffset(visibleWindow);
+
+    const timescale = new TimeScale(alignedWindow, {
       left: 0,
       right: trackRect.width,
     });
 
     const maybeNewResolution = calculateResolution(
-      visibleWindow,
+      alignedWindow,
       trackRect.width,
     );
     if (!maybeNewResolution.ok) {
@@ -324,7 +330,7 @@ export class TrackView {
       trackRenderer?.render({
         trackUri: node.uri,
         trackNode: node,
-        visibleWindow,
+        visibleWindow: alignedWindow,
         size: trackRect,
         resolution: maybeNewResolution.value,
         ctx,
@@ -414,11 +420,47 @@ export class TrackView {
   }
 
   private getTimescaleForBounds(bounds: Bounds2D) {
-    const timeWindow = this.trace.timeline.visibleWindow;
+    const timeWindow = this.applyAlignmentOffset(
+      this.trace.timeline.visibleWindow,
+    );
     return new TimeScale(timeWindow, {
       left: 0,
       right: bounds.right - bounds.left,
     });
+  }
+
+  // Returns `window` shifted so this track's group alignment offset is applied.
+  // Tracks under an aligned top-level group see a window translated by
+  // -offset, so an event at real ts is drawn where ts+offset would otherwise
+  // be (and the SQL query for the visible window shifts to match).
+  private applyAlignmentOffset(
+    window: HighPrecisionTimeSpan,
+  ): HighPrecisionTimeSpan {
+    const offset = this.alignmentOffset();
+    if (offset === 0n) return window;
+    return window.translate(-Number(offset));
+  }
+
+  // Finds the alignment offset for the top-level group this track belongs to
+  // (0n if none). The top-level group is the highest ancestor below the
+  // workspace root.
+  // Finds the alignment offset for the machine this track belongs to (0n if
+  // none). machine_id is not on track tags, so we resolve it from the track's
+  // upid/utid tag via the timeline's precomputed maps.
+  private alignmentOffset(): bigint {
+    const timeline = this.trace.timeline;
+    if (!timeline.hasTimeAlignment) return 0n;
+    if (this.node.uri === undefined) return 0n;
+    const tags = this.trace.tracks.getTrack(this.node.uri)?.tags;
+    if (tags === undefined) return 0n;
+    let machine: number | undefined;
+    if (tags.utid !== undefined) {
+      machine = timeline.machineForUtid(tags.utid);
+    } else if (tags.upid !== undefined) {
+      machine = timeline.machineForUpid(tags.upid);
+    }
+    if (machine === undefined) return 0n;
+    return timeline.machineTimeOffset(machine) ?? 0n;
   }
 
   private isHighlighted() {

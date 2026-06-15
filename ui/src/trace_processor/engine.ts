@@ -46,6 +46,10 @@ export interface TraceProcessorConfig {
   ftraceDropUntilAllCpusValid: boolean;
   extraParsingDescriptors?: ReadonlyArray<Uint8Array>;
   forceFullSort: boolean;
+  // When true, each top-level trace file loaded together gets its own
+  // machine_id so identically-named processes from different files stay
+  // distinct (trace comparison / diff workflow).
+  separateMachinePerTraceFile?: boolean;
 }
 
 const QUERY_LOG_BUFFER_SIZE = 1024;
@@ -435,6 +439,7 @@ export abstract class EngineBase implements Engine, Disposable {
     ftraceDropUntilAllCpusValid,
     extraParsingDescriptors,
     forceFullSort,
+    separateMachinePerTraceFile,
   }: TraceProcessorConfig): Promise<void> {
     const asyncRes = defer<void>();
     this.pendingResetTraceProcessors.push(asyncRes);
@@ -449,6 +454,9 @@ export abstract class EngineBase implements Engine, Disposable {
     args.ingestFtraceInRawTable = ingestFtraceInRawTable;
     args.analyzeTraceProtoContent = analyzeTraceProtoContent;
     args.ftraceDropUntilAllCpusValid = ftraceDropUntilAllCpusValid;
+    if (separateMachinePerTraceFile !== undefined) {
+      args.separateMachinePerTraceFile = separateMachinePerTraceFile;
+    }
     args.sortingMode = forceFullSort
       ? protos.ResetTraceProcessorArgs.SortingMode.FORCE_FULL_SORT
       : protos.ResetTraceProcessorArgs.SortingMode.DEFAULT_HEURISTICS;

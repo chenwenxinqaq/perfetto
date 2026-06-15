@@ -387,6 +387,12 @@ message ResetTraceProcessorArgs {
 
   // A list of serialized FileDescriptorSet protos.
   repeated bytes extra_parsing_descriptors = 7;
+
+  // If true, each top-level trace file loaded together (e.g. via a TAR archive
+  // of multiple files) is assigned its own machine_id, so identically-named
+  // processes/threads from different files are kept distinct instead of being
+  // merged. Used by the trace-comparison/diff workflow.
+  optional bool separate_machine_per_trace_file = 8;
 }
 
 message RegisterSqlPackageArgs {

@@ -31,6 +31,7 @@ import {Stack, StackAuto} from '../../widgets/stack';
 import {TextInput} from '../../widgets/text_input';
 import {Intent} from '../../widgets/common';
 import {Callout} from '../../widgets/callout';
+import {getAlignmentController} from './trace_alignment';
 
 const FILTER_TEXT_BOX_REF = 'filter-text-box';
 const COMPACT_BUTTONS = true;
@@ -85,8 +86,72 @@ export class TimelineToolbar implements m.ClassComponent<TimelineToolbarAttrs> {
       }),
       this.renderTrackFilter(trace),
       this.renderWorkspaceMenu(trace),
+      this.renderAlignMenu(trace),
       m(StackAuto),
       selection.kind === 'area' && this.renderBulkTracksMenu(trace, selection),
+    );
+  }
+
+  // Cross-trace timeline alignment: enter a mode, click a kernel in each
+  // trace, and one whole trace (its machine) is shifted so they line up.
+  private renderAlignMenu(trace: TraceImpl) {
+    const ctl = getAlignmentController(trace);
+    const {a, b} = ctl.anchors;
+    const aligned = trace.timeline.hasTimeAlignment;
+    return m(
+      PopupMenu,
+      {
+        trigger: m(Button, {
+          label: 'Align',
+          icon: 'compare_arrows',
+          compact: COMPACT_BUTTONS,
+          intent: ctl.active ? Intent.Primary : Intent.None,
+        }),
+      },
+      [
+        m(MenuTitle, {label: 'Align traces by a kernel'}),
+        m(MenuItem, {
+          label: 'Align by start time',
+          icon:
+            ctl.edge === 'start'
+              ? 'radio_button_checked'
+              : 'radio_button_unchecked',
+          closePopupOnClick: false,
+          onclick: () => ctl.setEdge('start'),
+        }),
+        m(MenuItem, {
+          label: 'Align by end time',
+          icon:
+            ctl.edge === 'end'
+              ? 'radio_button_checked'
+              : 'radio_button_unchecked',
+          closePopupOnClick: false,
+          onclick: () => ctl.setEdge('end'),
+        }),
+        m(MenuDivider),
+        m(MenuItem, {
+          label: ctl.active ? 'Cancel alignment mode' : 'Pick two kernels…',
+          icon: ctl.active ? 'close' : 'ads_click',
+          closePopupOnClick: false,
+          onclick: () => (ctl.active ? ctl.exit() : ctl.enter()),
+        }),
+        ctl.active &&
+          m(MenuItem, {
+            disabled: true,
+            label:
+              a === undefined
+                ? 'Click a kernel in the reference trace'
+                : b === undefined
+                  ? 'Now click a kernel in the other trace'
+                  : 'Aligned',
+          }),
+        (aligned || a !== undefined) &&
+          m(MenuItem, {
+            label: 'Reset alignment',
+            icon: 'restart_alt',
+            onclick: () => ctl.reset(),
+          }),
+      ],
     );
   }
 

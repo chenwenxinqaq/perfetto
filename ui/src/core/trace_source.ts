@@ -37,6 +37,9 @@ export interface TraceFileSource {
 export interface TraceMultipleFilesSource {
   readonly type: 'MULTIPLE_FILES';
   readonly files: ReadonlyArray<File>;
+  // When true, each file is given its own machine_id so identically-named
+  // processes from different files stay distinct (trace comparison / diff).
+  readonly separateMachines?: boolean;
 }
 
 export interface TraceUrlSource {

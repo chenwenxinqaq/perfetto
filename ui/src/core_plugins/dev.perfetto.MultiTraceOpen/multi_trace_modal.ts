@@ -37,6 +37,9 @@ const MODAL_KEY = 'multi-trace-modal';
 
 interface MultiTraceModalAttrs {
   initialFiles: ReadonlyArray<File>;
+  // When true, each trace is loaded with its own machine_id so identically
+  // named processes stay distinct and the traces can be aligned/compared.
+  separateMachines?: boolean;
 }
 
 class MultiTraceModalShell implements m.ClassComponent<MultiTraceModalAttrs> {
@@ -44,8 +47,10 @@ class MultiTraceModalShell implements m.ClassComponent<MultiTraceModalAttrs> {
     redrawModal(),
   );
   private currentTab = 'synchronous';
+  private separateMachines = false;
 
   oncreate({attrs}: m.Vnode<MultiTraceModalAttrs>) {
+    this.separateMachines = attrs.separateMachines ?? false;
     this.controller.addFiles(attrs.initialFiles);
   }
 
@@ -198,7 +203,9 @@ class MultiTraceModalShell implements m.ClassComponent<MultiTraceModalAttrs> {
       return;
     }
     const files = this.controller.traces.map((t) => t.file);
-    AppImpl.instance.openTraceFromMultipleFiles(files);
+    AppImpl.instance.openTraceFromMultipleFiles(files, {
+      separateMachines: this.separateMachines,
+    });
     closeModal(MODAL_KEY);
   }
 }
@@ -332,13 +339,20 @@ class TraceListComponent implements m.ClassComponent<TraceListComponentAttrs> {
 // Public API & Helpers
 // =============================================================================
 
-export function showMultiTraceModal(initialFiles: ReadonlyArray<File>) {
+export function showMultiTraceModal(
+  initialFiles: ReadonlyArray<File>,
+  opts?: {separateMachines?: boolean},
+) {
   showModal({
     title: 'Open Multiple Traces',
     icon: 'library_books',
     key: MODAL_KEY,
     className: 'pf-multi-trace-modal-override',
-    content: () => m(MultiTraceModalShell, {initialFiles}),
+    content: () =>
+      m(MultiTraceModalShell, {
+        initialFiles,
+        separateMachines: opts?.separateMachines,
+      }),
   });
 }
 

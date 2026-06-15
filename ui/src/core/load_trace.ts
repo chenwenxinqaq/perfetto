@@ -135,13 +135,14 @@ export async function loadTrace(
 ): Promise<TraceImpl> {
   updateStatus(app, 'Opening trace');
   const engineId = `${++lastEngineId}`;
-  const engine = await createEngine(app, engineId);
+  const engine = await createEngine(app, engineId, traceSource);
   return await loadTraceIntoEngine(app, traceSource, engine);
 }
 
 async function createEngine(
   app: AppImpl,
   engineId: string,
+  traceSource: TraceSource,
 ): Promise<EngineBase> {
   // Check if there is any instance of the trace_processor_shell running in
   // HTTP RPC mode (i.e. trace_processor_shell -D).
@@ -169,6 +170,9 @@ async function createEngine(
       ftraceDropUntilAllCpusValid: FTRACE_DROP_UNTIL_FLAG.get(),
       extraParsingDescriptors: descriptorBlobs,
       forceFullSort: FORCE_FULL_SORT_FLAG.get(),
+      separateMachinePerTraceFile:
+        traceSource.type === 'MULTIPLE_FILES' &&
+        traceSource.separateMachines === true,
     });
   }
   engine.onResponseReceived = () => raf.scheduleFullRedraw();

@@ -215,6 +215,13 @@ struct PERFETTO_EXPORT_COMPONENT Config {
   // When provided, these descriptors allow trace processor to parse custom
   // protobuf messages that are not compiled into Perfetto
   std::vector<std::string> extra_parsing_descriptors;
+
+  // If true, each top-level trace file loaded together (e.g. multiple files
+  // packed into a TAR archive) is assigned its own machine_id. This keeps
+  // identically-named processes/threads from different files distinct instead
+  // of merging them into one. Used by the trace-comparison/diff workflow; has
+  // no effect when a single trace file is loaded.
+  bool separate_machine_per_trace_file = false;
 };
 
 // Represents a dynamically typed value returned by SQL.

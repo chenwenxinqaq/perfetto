@@ -575,6 +575,10 @@ void Rpc::ResetTraceProcessor(const uint8_t* args, size_t len) {
     config.extra_parsing_descriptors.emplace_back(
         reinterpret_cast<const char*>(bytes.data), bytes.size);
   }
+  if (reset_trace_processor_args.has_separate_machine_per_trace_file()) {
+    config.separate_machine_per_trace_file =
+        reset_trace_processor_args.separate_machine_per_trace_file();
+  }
   ResetTraceProcessorInternal(config);
 }
 

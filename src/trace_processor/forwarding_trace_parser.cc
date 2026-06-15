@@ -159,7 +159,17 @@ base::Status ForwardingTraceParser::Init(const TraceBlobView& blob) {
     // TODO(b/334978369) Make sure kProtoTraceType and kSystraceTraceType are
     // parsed first so that we do not get issues with
     // SetPidZeroIsUpidZeroIdleProcess()
-    trace_context_ = input_context_->ForkContextForTrace(file_id_, 0);
+    //
+    // For the trace-comparison workflow, each top-level file is given its own
+    // machine_id so identically-named processes/threads from different files
+    // are kept distinct instead of merged. file_id 0 is the synthetic root
+    // (e.g. the TAR container) which must stay on the default machine, so we
+    // offset by file_id (file 1 -> machine 1, ...). Otherwise everything stays
+    // on the default machine (machine 0), preserving the existing behaviour.
+    uint32_t machine_id = input_context_->config.separate_machine_per_trace_file
+                              ? file_id_.value
+                              : 0;
+    trace_context_ = input_context_->ForkContextForTrace(file_id_, machine_id);
     if (trace_type_ == kProtoTraceType || trace_type_ == kSystraceTraceType) {
       trace_context_->process_tracker->SetPidZeroIsUpidZeroIdleProcess();
     }
