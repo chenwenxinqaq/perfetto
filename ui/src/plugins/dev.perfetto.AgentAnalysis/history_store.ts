@@ -35,6 +35,7 @@ const SAVED_TURN_SCHEMA = z.object({
   role: z.union([z.literal('user'), z.literal('assistant')]),
   text: z.string(),
   isError: z.boolean().optional(),
+  toolNotes: z.array(z.string()).optional(),
   chips: z.array(SAVED_CHIP_SCHEMA).optional(),
 });
 

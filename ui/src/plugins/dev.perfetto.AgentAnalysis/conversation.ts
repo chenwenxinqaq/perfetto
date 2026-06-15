@@ -27,6 +27,10 @@ import type {
   SavedConversation,
 } from './history_store';
 import type {LlmClient, LlmMessage} from './llm_client';
+import type {Tool} from './tools';
+
+// Cap on agentic tool-call rounds per user message, to bound cost / loops.
+const MAX_TOOL_ROUNDS = 8;
 
 // A trace region the user attached to their next message, shown as a chip.
 export interface SelectionChip {
@@ -41,6 +45,8 @@ export interface Turn {
   text: string; // Display text (also streamed into for assistant turns).
   chips?: ReadonlyArray<{readonly id: string; readonly label: string}>;
   llmContent?: string; // What is actually sent to the LLM (may include SQL).
+  // Tool calls the assistant ran while producing this turn (for display).
+  toolNotes?: string[];
   isError?: boolean;
 }
 
@@ -50,6 +56,8 @@ export interface ConversationDeps {
   readonly traceStart: time;
   readonly resolveTrackName: (uri: string) => string;
   readonly store: ConversationHistoryStore;
+  // The tools the agent may call (e.g. run_perfetto_sql).
+  readonly tools: ReadonlyArray<Tool>;
 }
 
 let convSeq = 0;
@@ -143,6 +151,7 @@ export class Conversation {
         role: t.role,
         text: t.text,
         isError: t.isError,
+        toolNotes: t.toolNotes ? [...t.toolNotes] : undefined,
         chips: t.chips?.map((c, i) => ({id: `saved-${i}`, label: c.label})),
       });
     }
@@ -168,6 +177,7 @@ export class Conversation {
         role: t.role,
         text: t.text,
         isError: t.isError,
+        toolNotes: t.toolNotes,
         chips: t.chips?.map((c) => ({label: c.label})),
       })),
     });
@@ -212,20 +222,84 @@ export class Conversation {
     this.turns.push(assistant);
     m.redraw();
 
-    // Assemble the full multi-turn history for the API.
-    const history: LlmMessage[] = this.turns
+    // Assemble the full multi-turn history for the API from prior turns.
+    const messages: LlmMessage[] = this.turns
       .slice(0, -1) // exclude the empty assistant turn we just pushed
       .map((t) => ({
         role: t.role,
         content: t.role === 'user' ? t.llmContent ?? t.text : t.text,
       }));
 
+    const toolDefs = this.deps.tools.map((t) => t.def);
+    const toolByName = new Map(
+      this.deps.tools.map((t) => [t.def.function.name, t]),
+    );
+
     try {
-      for await (const chunk of this.deps.client.send(history, model, signal)) {
-        assistant.text += chunk.text;
-        m.redraw();
+      // Agentic loop: stream a turn; if the model asked for tools, run them,
+      // feed results back, and continue. Stop when a turn has no tool calls.
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        let toolCalls: ReadonlyArray<{
+          id: string;
+          name: string;
+          arguments: string;
+        }> = [];
+        for await (const ev of this.deps.client.send(
+          messages,
+          model,
+          toolDefs,
+          signal,
+        )) {
+          if (ev.textDelta !== undefined && ev.textDelta !== '') {
+            assistant.text += ev.textDelta;
+            m.redraw();
+          }
+          if (ev.toolCalls !== undefined) {
+            toolCalls = ev.toolCalls;
+          }
+        }
+
+        if (toolCalls.length === 0) break; // Final answer produced.
+
+        // Record the assistant's tool-call turn, then execute each call and
+        // feed the results back as 'tool' messages.
+        messages.push({
+          role: 'assistant',
+          content: assistant.text,
+          toolCalls,
+        });
+        for (const call of toolCalls) {
+          const tool = toolByName.get(call.name);
+          let resultContent: string;
+          let note: string;
+          if (tool === undefined) {
+            resultContent = `Error: unknown tool "${call.name}".`;
+            note = `unknown tool ${call.name}`;
+          } else {
+            try {
+              const args = JSON.parse(call.arguments || '{}') as Record<
+                string,
+                unknown
+              >;
+              const r = await tool.run(args);
+              resultContent = r.content;
+              note = r.summary;
+            } catch (e: unknown) {
+              resultContent = `Error: ${String(e)}`;
+              note = `error: ${String(e)}`;
+            }
+          }
+          (assistant.toolNotes ??= []).push(note);
+          messages.push({
+            role: 'tool',
+            content: resultContent,
+            toolCallId: call.id,
+          });
+          m.redraw();
+        }
       }
-      if (assistant.text === '') {
+
+      if (assistant.text === '' && (assistant.toolNotes?.length ?? 0) === 0) {
         assistant.text = '(no response)';
       }
     } catch (e: unknown) {

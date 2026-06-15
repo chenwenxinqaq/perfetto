@@ -27,11 +27,15 @@ import {AnalysisPanel} from './analysis_panel';
 import {Conversation} from './conversation';
 import {ConversationHistoryStore} from './history_store';
 import {LlmClient} from './llm_client';
+import {pickProfilePrompt} from './profiles';
+import {buildTools} from './tools';
 
 const DEFAULT_SYSTEM_PROMPT = `You are an expert Perfetto trace analyst.
 Given a selected time range and compact SQL summaries, explain what happened,
 call out suspicious performance issues, and suggest concrete next queries or UI
-checks. Be concise and avoid inventing facts not supported by the data.`;
+checks. You can call the run_perfetto_sql tool to query the trace directly with
+read-only PerfettoSQL — prefer verifying claims with real data over guessing.
+Be concise and avoid inventing facts not supported by the data.`;
 
 export default class AgentAnalysisPlugin implements PerfettoPlugin {
   static readonly id = 'dev.perfetto.AgentAnalysis';
@@ -42,6 +46,7 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
   static tokenSetting: Setting<string>;
   static modelSetting: Setting<string>;
   static promptSetting: Setting<string>;
+  static profilesSetting: Setting<string>;
 
   static onActivate(app: App): void {
     AgentAnalysisPlugin.endpointSetting = app.settings.register({
@@ -78,14 +83,32 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
       schema: z.string(),
       defaultValue: DEFAULT_SYSTEM_PROMPT,
     });
+
+    AgentAnalysisPlugin.profilesSetting = app.settings.register({
+      id: `${AgentAnalysisPlugin.id}#PromptProfiles`,
+      name: 'Agent Analysis prompt profiles',
+      description:
+        'JSON describing domain prompt profiles: ' +
+        '{"profiles":[{"name","match"(a count SQL >0 to apply),"prompt"}]}. ' +
+        'The first profile whose match query returns >0 has its prompt ' +
+        'appended to the system prompt. See the plugin README / ' +
+        'prompt_profiles.json for an XPU example. Empty disables profiles.',
+      schema: z.string(),
+      defaultValue: '',
+    });
   }
 
   async onTraceLoad(trace: Trace): Promise<void> {
+    // Domain prompt appended once we've detected which profile (if any) the
+    // trace matches; resolved asynchronously below.
+    let profilePrompt = '';
     const makeClient = () =>
       new LlmClient({
         endpoint: AgentAnalysisPlugin.endpointSetting.get(),
         apiKey: AgentAnalysisPlugin.tokenSetting.get(),
-        systemPrompt: AgentAnalysisPlugin.promptSetting.get(),
+        systemPrompt:
+          AgentAnalysisPlugin.promptSetting.get() +
+          (profilePrompt !== '' ? `\n\n${profilePrompt}` : ''),
       });
 
     // One conversation per trace, so history survives selection changes and
@@ -98,8 +121,19 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
         trace.workspaces.currentWorkspace.flatTracks.find((t) => t.uri === uri)
           ?.name ?? uri,
       store: new ConversationHistoryStore(trace.traceInfo.uuid),
+      tools: buildTools(trace.engine),
     });
     trace.trash.defer(() => conversation.dispose());
+
+    // Detect the matching domain profile once the trace is queryable, then
+    // rebuild the client so its system prompt includes the domain semantics.
+    trace.onTraceReady.addListener(async () => {
+      profilePrompt = await pickProfilePrompt(
+        trace.engine,
+        AgentAnalysisPlugin.profilesSetting.get(),
+      );
+      if (profilePrompt !== '') conversation.refreshClient(makeClient());
+    });
 
     // Renders either the missing-token prompt or the chat panel. `selection`
     // is undefined when hosted as a standalone page (sidebar entry).

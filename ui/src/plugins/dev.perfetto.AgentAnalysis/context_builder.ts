@@ -25,12 +25,37 @@ export async function buildSelectionContext(
   const durNs = selection.end - selection.start;
   const durMs = Duration.toMilliseconds(durNs).toFixed(3);
 
+  // Resolve the selected tracks to their underlying trace_processor track_ids
+  // so the summaries reflect ONLY the selected tracks, not the whole trace.
+  // (One UI track can back several sql track_ids; non-slice tracks contribute
+  // none.) Mirrors the pattern in core/flow_manager.ts.
+  const trackIds: number[] = [];
+  for (const t of selection.tracks) {
+    if (
+      t.renderer?.rootTableName !== undefined &&
+      t.renderer.rootTableName !== 'slice'
+    ) {
+      continue;
+    }
+    for (const id of t.tags?.trackIds ?? []) trackIds.push(id);
+  }
+  const uniqueTrackIds = [...new Set(trackIds)];
+  // SQL fragment restricting to the selected tracks; empty (no restriction)
+  // when we couldn't resolve any track_ids, to preserve prior behaviour.
+  const trackFilter =
+    uniqueTrackIds.length > 0
+      ? `AND track_id IN (${uniqueTrackIds.join(',')})`
+      : '';
+
   const lines: string[] = [
     `## Selected Time Range`,
     `- Start: ${Time.toSeconds(selection.start).toFixed(6)}s`,
     `- End: ${Time.toSeconds(selection.end).toFixed(6)}s`,
     `- Duration: ${durMs}ms`,
-    `- Tracks selected: ${selection.tracks.length}`,
+    `- Tracks selected: ${selection.tracks.length}` +
+      (uniqueTrackIds.length > 0
+        ? ` (${uniqueTrackIds.length} sql track_ids)`
+        : ''),
     '',
   ];
 
@@ -45,7 +70,8 @@ export async function buildSelectionContext(
     lines.push('');
   }
 
-  // Top slices by total duration in the selection window.
+  // Top slices by total duration in the selection window, restricted to the
+  // selected tracks.
   try {
     const res = await engine.query(`
       WITH overlapping_slices AS (
@@ -56,6 +82,7 @@ export async function buildSelectionContext(
         WHERE dur > 0
           AND ts < ${selection.end}
           AND ts + dur > ${selection.start}
+          ${trackFilter}
       )
       SELECT
         name,
@@ -86,6 +113,44 @@ export async function buildSelectionContext(
     }
   } catch {
     // Not all traces have the slice table; skip.
+  }
+
+  // If the selected slices carry a `device` arg (XPU/GPU-style traces),
+  // summarise busy time per device — purely data-driven, no hard-coded names.
+  try {
+    const res = await engine.query(`
+      WITH sel AS (
+        SELECT
+          extract_arg(arg_set_id, 'args.device') AS device,
+          min(ts + dur, ${selection.end}) - max(ts, ${selection.start}) AS d
+        FROM slice
+        WHERE dur > 0
+          AND ts < ${selection.end}
+          AND ts + dur > ${selection.start}
+          ${trackFilter}
+      )
+      SELECT device, count(*) AS cnt, CAST(sum(d) / 1e6 AS REAL) AS total_ms
+      FROM sel
+      WHERE device IS NOT NULL
+      GROUP BY device
+      ORDER BY device
+      LIMIT 32
+    `);
+    const iter = res.iter({});
+    const rows: string[] = [];
+    for (; iter.valid(); iter.next()) {
+      const device = Number(iter.get('device'));
+      const cnt = Number(iter.get('cnt'));
+      const totalMs = Number(iter.get('total_ms')).toFixed(3);
+      rows.push(`  device ${device}: count=${cnt} | total=${totalMs}ms`);
+    }
+    if (rows.length > 0) {
+      lines.push(`## Slices by device (args.device)`);
+      lines.push(...rows);
+      lines.push('');
+    }
+  } catch {
+    // No device arg / no slice table; skip.
   }
 
   // CPU scheduling latency summary.

@@ -16,6 +16,14 @@ you press **Send**.
   matching `/v1/models` endpoint and shown in a dropdown.
 - Multi-turn chat: conversation history is kept per-trace and survives selection
   changes. Selecting a new region attaches it as a chip rather than resetting.
+- **Agentic SQL tool**: the model can call a read-only `run_perfetto_sql` tool
+  to query the trace directly (via trace_processor) and verify hypotheses with
+  real data instead of guessing. Tool calls are shown inline in the transcript
+  ("🔧 SQL: … → N rows"). Only `SELECT` / `WITH` / `INCLUDE PERFETTO MODULE`
+  statements are allowed; results are capped to keep them summarisable.
+- Selection summaries are restricted to the **selected tracks** (their
+  trace_processor `track_id`s), so selecting different tracks yields different
+  summaries.
 
 ## Settings
 
@@ -26,14 +34,38 @@ straight there if the token is missing):
 |---|---|---|
 | API endpoint | `https://oneapi-comate.baidu-int.com/v1/chat/completions` | Any OpenAI-compatible endpoint. |
 | API token | _(empty)_ | Your bearer token. Stored only in this browser's `localStorage`; never bundled into the build. |
-| Model | `Claude Sonnet 4.6` | Default model; can be switched live in the panel. |
+| Model | `Claude Sonnet 4.6` | Default model; can be switched live in the panel. The model must support OpenAI function/tool calling for the SQL tool to work (e.g. gpt-5.5). |
 | System prompt | _(built-in)_ | Optional override. |
+| Prompt profiles | _(empty)_ | JSON describing domain prompt profiles (see below). |
 
 > The default endpoint is an **internal** gateway (`*.baidu-int.com`). It only
 > resolves from within the corporate network. If you deploy this publicly,
 > users on the corporate network can use it as-is by filling in their token;
 > off-network users must point the endpoint at a reachable OpenAI-compatible
 > service.
+
+## Prompt profiles (domain semantics, not hard-coded)
+
+The agent doesn't natively understand domain-specific trace shapes (e.g. XPU
+compute-card captures). Rather than hard-coding that knowledge, you supply it as
+JSON in the **Prompt profiles** setting:
+
+```json
+{"profiles": [{"name": "...", "match": "SELECT count(*) FROM ... ", "prompt": "DOMAIN: ..."}]}
+```
+
+On trace load each profile's `match` query (a read-only count) is run; the first
+one returning `> 0` has its `prompt` appended to the system prompt, so the agent
+gets the right vocabulary automatically. The setting is empty by default.
+
+A ready-made profile for XPU traces ships in
+[`prompt_profiles.json`](./prompt_profiles.json) — copy its contents into the
+**Prompt profiles** setting. It teaches the agent about XPU HW processes,
+`SSE-Channel-*` queues, `cluster`/`sdnn` units, CPU dispatch processes, the
+`args.device` link and the `xpu_device_map` view (published by the
+`dev.perfetto.XpuWorkspace` plugin), plus how to measure channel overlap
+correctly (interval sweep, not `sum(dur)/wall_time`).
+
 
 ## Deploying to GitHub Pages
 

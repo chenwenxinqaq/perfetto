@@ -240,6 +240,34 @@
     color: var(--pf-color-text-muted, #777);
   }
 
+  // Tool-call notes shown above the assistant's answer (e.g. "SQL: … → N rows").
+  &__tools {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 8px;
+  }
+
+  &__tool {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-family: var(--pf-font-mono, monospace);
+    color: var(--pf-color-text-muted, #667);
+    background: rgba(120, 120, 120, 0.1);
+    border-radius: 6px;
+    padding: 3px 8px;
+
+    .pf-icon {
+      font-size: 14px;
+    }
+  }
+
+  &__tool-text {
+    overflow-wrap: anywhere;
+  }
+
   // ---- Composer -----------------------------------------------------------
 
   &__composer {

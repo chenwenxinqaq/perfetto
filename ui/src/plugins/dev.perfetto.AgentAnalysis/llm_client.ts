@@ -17,19 +17,43 @@
 // same client works against OpenAI, Claude/GPT/Wenxin via a OneAPI gateway,
 // etc.
 
-export interface LlmChunk {
-  readonly text: string;
+import type {ToolDef} from './tools';
+
+// A tool/function call requested by the model.
+export interface ToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly arguments: string; // Raw JSON string of the arguments.
 }
 
 export interface LlmMessage {
-  readonly role: 'user' | 'assistant';
+  readonly role: 'user' | 'assistant' | 'tool';
+  // Text content. May be empty for an assistant turn that only calls tools.
   readonly content: string;
+  // Present on assistant turns that requested tool calls.
+  readonly toolCalls?: ReadonlyArray<ToolCall>;
+  // Present on 'tool' turns: which call this result answers.
+  readonly toolCallId?: string;
+}
+
+// One streamed event: either a text fragment or the (final) set of tool calls
+// the model wants executed before it continues.
+export interface LlmEvent {
+  readonly textDelta?: string;
+  readonly toolCalls?: ReadonlyArray<ToolCall>;
 }
 
 export interface LlmClientOpts {
   readonly endpoint: string; // e.g. https://host/v1/chat/completions
   readonly apiKey: string;
   readonly systemPrompt: string;
+}
+
+// Accumulates streamed OpenAI tool_call fragments, keyed by their `index`.
+interface PartialToolCall {
+  id: string;
+  name: string;
+  args: string;
 }
 
 export class LlmClient {
@@ -72,14 +96,16 @@ export class LlmClient {
       .sort((a, b) => a.localeCompare(b));
   }
 
-  // Sends a multi-turn conversation with the given model and yields
-  // incremental text chunks. The configured system prompt is prepended
-  // automatically.
+  // Sends a multi-turn conversation with the given model and yields streamed
+  // events: text fragments as they arrive, and — if the model decides to call
+  // tools — a final event carrying the accumulated tool calls. The configured
+  // system prompt is prepended automatically.
   async *send(
     messages: ReadonlyArray<LlmMessage>,
     model: string,
+    tools: ReadonlyArray<ToolDef> | undefined,
     signal?: AbortSignal,
-  ): AsyncGenerator<LlmChunk, void, void> {
+  ): AsyncGenerator<LlmEvent, void, void> {
     const resp = await fetch(this.opts.endpoint, {
       method: 'POST',
       headers: {
@@ -91,8 +117,9 @@ export class LlmClient {
         stream: true,
         messages: [
           {role: 'system', content: this.opts.systemPrompt},
-          ...messages,
+          ...messages.map(serializeMessage),
         ],
+        ...(tools && tools.length > 0 ? {tools, tool_choice: 'auto'} : {}),
       }),
       signal,
     });
@@ -105,6 +132,8 @@ export class LlmClient {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    // Tool calls are streamed as fragments keyed by index; accumulate them.
+    const partialCalls = new Map<number, PartialToolCall>();
 
     for (;;) {
       const {value, done} = await reader.read();
@@ -125,20 +154,69 @@ export class LlmClient {
         try {
           const chunk = JSON.parse(payload) as {
             readonly choices?: ReadonlyArray<{
-              readonly delta?: {readonly content?: string};
+              readonly delta?: {
+                readonly content?: string;
+                readonly tool_calls?: ReadonlyArray<{
+                  readonly index: number;
+                  readonly id?: string;
+                  readonly function?: {
+                    readonly name?: string;
+                    readonly arguments?: string;
+                  };
+                }>;
+              };
             }>;
             readonly delta?: {readonly text?: string};
           };
+          const delta = chunk.choices?.[0]?.delta;
           const text =
-            chunk.choices?.[0]?.delta?.content ??
+            delta?.content ??
             // Anthropic-compatible streaming gateways often use this shape.
             chunk.delta?.text ??
             '';
-          if (text !== '') yield {text};
+          if (text !== '') yield {textDelta: text};
+
+          for (const tc of delta?.tool_calls ?? []) {
+            const cur = partialCalls.get(tc.index) ?? {
+              id: '',
+              name: '',
+              args: '',
+            };
+            if (tc.id) cur.id = tc.id;
+            if (tc.function?.name) cur.name = tc.function.name;
+            if (tc.function?.arguments) cur.args += tc.function.arguments;
+            partialCalls.set(tc.index, cur);
+          }
         } catch {
           // Skip unparseable events
         }
       }
     }
+
+    if (partialCalls.size > 0) {
+      const calls: ToolCall[] = [...partialCalls.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, c]) => ({id: c.id, name: c.name, arguments: c.args}));
+      yield {toolCalls: calls};
+    }
   }
+}
+
+// Translates our LlmMessage into the OpenAI wire shape.
+function serializeMessage(m: LlmMessage): object {
+  if (m.role === 'tool') {
+    return {role: 'tool', tool_call_id: m.toolCallId, content: m.content};
+  }
+  if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
+    return {
+      role: 'assistant',
+      content: m.content === '' ? null : m.content,
+      tool_calls: m.toolCalls.map((c) => ({
+        id: c.id,
+        type: 'function',
+        function: {name: c.name, arguments: c.arguments},
+      })),
+    };
+  }
+  return {role: m.role, content: m.content};
 }

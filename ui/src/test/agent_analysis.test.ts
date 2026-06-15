@@ -81,16 +81,38 @@ test.beforeAll(async ({browser}, testInfo) => {
     });
   });
 
-  // Intercept the LLM call and reply with two OpenAI-style SSE deltas. The
-  // first delta echoes the requested model so the test can assert which model
-  // was used.
+  // Intercept the LLM call. If the request advertises tools AND the running
+  // conversation hasn't produced a tool result yet, the first response asks to
+  // call run_perfetto_sql; once a 'tool' message is present we stream the final
+  // answer. The first text delta echoes the requested model.
   await page.route('**/v1/chat/completions', async (route) => {
-    const req = route.request().postDataJSON() as {model?: string};
+    const req = route.request().postDataJSON() as {
+      model?: string;
+      tools?: unknown[];
+      messages?: Array<{role?: string}>;
+    };
     const usedModel = req?.model ?? '?';
-    const body =
-      `data: {"choices":[{"delta":{"content":"${MARKER} model=${usedModel} "}}]}\n\n` +
-      `data: {"choices":[{"delta":{"content":"analysis complete."}}]}\n\n` +
-      `data: [DONE]\n\n`;
+    const hasTools = Array.isArray(req?.tools) && req.tools.length > 0;
+    const sawToolResult = (req?.messages ?? []).some((m) => m.role === 'tool');
+
+    let body: string;
+    if (hasTools && !sawToolResult) {
+      // Round 1: ask to run a read-only SQL query.
+      body =
+        `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",` +
+        `"type":"function","function":{"name":"run_perfetto_sql",` +
+        `"arguments":""}}]}}]}\n\n` +
+        `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":` +
+        `{"arguments":"{\\"query\\":\\"SELECT count(*) AS n FROM slice\\"}"}}]}}]}\n\n` +
+        `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n` +
+        `data: [DONE]\n\n`;
+    } else {
+      // Round 2 (or no tools): stream the final textual answer.
+      body =
+        `data: {"choices":[{"delta":{"content":"${MARKER} model=${usedModel} "}}]}\n\n` +
+        `data: {"choices":[{"delta":{"content":"analysis complete."}}]}\n\n` +
+        `data: [DONE]\n\n`;
+    }
     await route.fulfill({
       status: 200,
       headers: {'content-type': 'text/event-stream'},
@@ -158,6 +180,15 @@ test('AI Analysis tab streams a mocked analysis for an area selection', async ()
   await expect(assistant).toContainText(MARKER, {timeout: 15_000});
   await expect(assistant).toContainText('model=gpt-5.5');
   await expect(assistant).toContainText('analysis complete.');
+
+  // The agent ran the read-only SQL tool en route to its answer; the tool note
+  // (with the real row count from trace_processor) is shown above the answer.
+  await expect(assistant.locator('.pf-agent-analysis__tool')).toContainText(
+    'SQL:',
+  );
+  await expect(assistant.locator('.pf-agent-analysis__tool')).toContainText(
+    'row',
+  );
 
   // The pending chip is consumed once sent.
   await expect(

@@ -230,11 +230,13 @@ export class AnalysisPanel implements m.ClassComponent<AnalysisPanelAttrs> {
       role: 'user' | 'assistant';
       text: string;
       isError?: boolean;
+      toolNotes?: string[];
       chips?: ReadonlyArray<{id: string; label: string}>;
     },
     index: number,
   ): m.Children {
     const isUser = turn.role === 'user';
+    const hasToolNotes = (turn.toolNotes?.length ?? 0) > 0;
     return m(
       `.pf-agent-analysis__msg.pf-agent-analysis__msg--${turn.role}`,
       {key: index},
@@ -257,12 +259,30 @@ export class AnalysisPanel implements m.ClassComponent<AnalysisPanelAttrs> {
               ),
             ),
           ),
+        // Tools the agent ran while producing this answer.
+        hasToolNotes &&
+          m(
+            '.pf-agent-analysis__tools',
+            turn.toolNotes!.map((note) =>
+              m(
+                '.pf-agent-analysis__tool',
+                m(Icon, {icon: 'build'}),
+                m('span.pf-agent-analysis__tool-text', note),
+              ),
+            ),
+          ),
         turn.text === ''
-          ? m(
-              '.pf-agent-analysis__typing',
-              m(Spinner, {easing: true}),
-              m('span', 'Thinking…'),
-            )
+          ? hasToolNotes
+            ? m(
+                '.pf-agent-analysis__typing',
+                m(Spinner, {easing: true}),
+                m('span', 'Working…'),
+              )
+            : m(
+                '.pf-agent-analysis__typing',
+                m(Spinner, {easing: true}),
+                m('span', 'Thinking…'),
+              )
           : isUser
             ? m('.pf-agent-analysis__user-text', turn.text)
             : m('.pf-agent-analysis__md', m.trust(this.md.render(turn.text))),
