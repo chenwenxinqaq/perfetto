@@ -16,14 +16,23 @@
 
 import type {Engine} from '../../trace_processor/engine';
 import type {AreaSelection} from '../../public/selection';
-import {Duration, Time} from '../../base/time';
+import {Duration, Time, type time} from '../../base/time';
 
 export async function buildSelectionContext(
   engine: Engine,
   selection: AreaSelection,
+  // Cross-trace alignment shifts a machine's tracks at render time by a
+  // constant ns offset, so an aligned trace's selection window is in DISPLAY
+  // coordinates (realTs + offset) while trace_processor stores the real ts.
+  // Subtract this offset from the window so the queries hit real slice ts;
+  // 0n (the default) leaves the window untouched for unaligned traces.
+  alignOffsetNs: bigint = 0n,
 ): Promise<string> {
   const durNs = selection.end - selection.start;
   const durMs = Duration.toMilliseconds(durNs).toFixed(3);
+  // Real (trace_processor) window: undo the render-time alignment shift.
+  const qStart = (selection.start - alignOffsetNs) as time;
+  const qEnd = (selection.end - alignOffsetNs) as time;
 
   // Resolve the selected tracks to their underlying trace_processor track_ids
   // so the summaries reflect ONLY the selected tracks, not the whole trace.
@@ -77,11 +86,11 @@ export async function buildSelectionContext(
       WITH overlapping_slices AS (
         SELECT
           name,
-          min(ts + dur, ${selection.end}) - max(ts, ${selection.start}) AS overlap_dur
+          min(ts + dur, ${qEnd}) - max(ts, ${qStart}) AS overlap_dur
         FROM slice
         WHERE dur > 0
-          AND ts < ${selection.end}
-          AND ts + dur > ${selection.start}
+          AND ts < ${qEnd}
+          AND ts + dur > ${qStart}
           ${trackFilter}
       )
       SELECT
@@ -122,11 +131,11 @@ export async function buildSelectionContext(
       WITH sel AS (
         SELECT
           extract_arg(arg_set_id, 'args.device') AS device,
-          min(ts + dur, ${selection.end}) - max(ts, ${selection.start}) AS d
+          min(ts + dur, ${qEnd}) - max(ts, ${qStart}) AS d
         FROM slice
         WHERE dur > 0
-          AND ts < ${selection.end}
-          AND ts + dur > ${selection.start}
+          AND ts < ${qEnd}
+          AND ts + dur > ${qStart}
           ${trackFilter}
       )
       SELECT device, count(*) AS cnt, CAST(sum(d) / 1e6 AS REAL) AS total_ms
@@ -162,8 +171,8 @@ export async function buildSelectionContext(
       FROM thread_state ss
       JOIN thread t USING (utid)
       JOIN process p USING (upid)
-      WHERE ss.ts >= ${selection.start}
-        AND ss.ts + ss.dur <= ${selection.end}
+      WHERE ss.ts >= ${qStart}
+        AND ss.ts + ss.dur <= ${qEnd}
         AND ss.state = 'Running'
       GROUP BY p.name
       ORDER BY cpu_ms DESC

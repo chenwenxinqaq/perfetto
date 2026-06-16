@@ -220,6 +220,11 @@ export interface Timeline {
   readonly hasTimeAlignment: boolean;
   // Removes all alignment offsets.
   clearTimeAlignment(): void;
+  // Resolve a process/thread to its machine_id (for applying alignment
+  // offsets, since machine_id isn't carried on track tags). undefined if the
+  // upid/utid has no machine or the maps haven't been populated.
+  machineForUpid(upid: number): number | undefined;
+  machineForUtid(utid: number): number | undefined;
 
   // This value defines the time of the origin of the time axis in trace time.
   // Depending on the timestamp format setting, this value can change:

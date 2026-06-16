@@ -58,6 +58,11 @@ export interface ConversationDeps {
   readonly store: ConversationHistoryStore;
   // The tools the agent may call (e.g. run_perfetto_sql).
   readonly tools: ReadonlyArray<Tool>;
+  // Render-time cross-trace alignment offset (ns) applied to an area's tracks,
+  // so selection summaries can convert the display window back to real ts.
+  // Returns 0n when the selection's trace isn't aligned. Optional (single-trace
+  // sessions don't need it).
+  readonly alignOffsetForArea?: (area: AreaSelection) => bigint;
 }
 
 let convSeq = 0;
@@ -203,7 +208,12 @@ export class Conversation {
     let llmContent = '';
     for (const chip of chips) {
       try {
-        const ctx = await buildSelectionContext(this.deps.engine, chip.area);
+        const offset = this.deps.alignOffsetForArea?.(chip.area) ?? 0n;
+        const ctx = await buildSelectionContext(
+          this.deps.engine,
+          chip.area,
+          offset,
+        );
         llmContent += `Selected region "${chip.label}":\n${ctx}\n\n`;
       } catch {
         // Skip a region whose context could not be built.

@@ -32,10 +32,13 @@ import {pickProfilePrompt} from './profiles';
 import {buildTools} from './tools';
 
 const DEFAULT_SYSTEM_PROMPT = `You are an expert Perfetto trace analyst.
-Given a selected time range and compact SQL summaries, explain what happened,
-call out suspicious performance issues, and suggest concrete next queries or UI
-checks. You can call the run_perfetto_sql tool to query the trace directly with
-read-only PerfettoSQL — prefer verifying claims with real data over guessing.
+You can be asked about a framed region of the timeline OR about the whole trace
+when nothing is selected — in the no-selection case, default to ALL loaded
+traces. Given a selected time range and compact SQL summaries, explain what
+happened, call out suspicious performance issues, and suggest concrete next
+queries or UI checks. You can call the run_perfetto_sql tool to query the trace
+directly with read-only PerfettoSQL — prefer verifying claims with real data
+over guessing.
 When the user loaded several traces together for comparison (via "Open traces
 for comparison (diff)"), each trace has its own machine_id: call
 list_loaded_traces first to see how many traces there are, and use
@@ -117,6 +120,29 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
   }
 
   async onTraceLoad(trace: Trace): Promise<void> {
+    // Cross-trace alignment shifts a machine's tracks at RENDER time by a
+    // constant ns offset, so an aligned trace's area selection is in DISPLAY
+    // coordinates (realTs + offset) while trace_processor stores the real ts.
+    // This resolves the offset for the tracks in an area (0n if unaligned) so
+    // selection summaries and the kernel tool can map the window back to real
+    // ts — otherwise an aligned trace's tracks return 0 rows.
+    const alignOffsetForArea = (tracks: AreaSelection['tracks']): bigint => {
+      if (!trace.timeline.hasTimeAlignment) return 0n;
+      for (const t of tracks) {
+        const tags = t.tags;
+        let machine: number | undefined;
+        if (tags?.utid !== undefined) {
+          machine = trace.timeline.machineForUtid(tags.utid);
+        } else if (tags?.upid !== undefined) {
+          machine = trace.timeline.machineForUpid(tags.upid);
+        }
+        if (machine !== undefined) {
+          return trace.timeline.machineTimeOffset(machine) ?? 0n;
+        }
+      }
+      return 0n;
+    };
+
     // Domain prompt appended once we've detected which profile (if any) the
     // trace matches; resolved asynchronously below.
     let profilePrompt = '';
@@ -170,13 +196,17 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
             if (rootTable !== undefined && rootTable !== 'slice') continue;
             for (const id of t.tags?.trackIds ?? []) trackIds.push(id);
           }
+          // Undo the render-time alignment shift so the queried window matches
+          // the real slice ts (an aligned trace would otherwise return 0 rows).
+          const offset = alignOffsetForArea(sel.tracks);
           return {
             trackIds,
-            startTs: Number(sel.start),
-            endTs: Number(sel.end),
+            startTs: Number(sel.start - offset),
+            endTs: Number(sel.end - offset),
           };
         },
       ),
+      alignOffsetForArea: (area) => alignOffsetForArea(area.tracks),
     });
     trace.trash.defer(() => conversation.dispose());
 
@@ -223,18 +253,28 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
       });
     };
 
-    // Entry point 1: a tab in the timeline area-selection drawer.
-    trace.selection.registerAreaSelectionTab({
-      id: 'agent_analysis',
-      name: 'AI Analysis',
-      priority: 100,
-      render: (selection) => ({
-        isLoading: false,
-        content: renderContent(selection),
-      }),
+    // A persistent tab in the details panel. Unlike an area-selection tab, it
+    // stays put when the selection changes or is cleared, so the conversation
+    // window is never torn down by clicking elsewhere. It reads the CURRENT
+    // selection itself: a framed area is attached as a chip; with nothing
+    // selected the agent simply defaults to the whole trace (all loaded
+    // traces). This is the primary, always-available entry point.
+    const TAB_URI = 'dev.perfetto.AgentAnalysis#tab';
+    trace.tabs.registerTab({
+      uri: TAB_URI,
+      isEphemeral: false,
+      content: {
+        getTitle: () => 'AI Analysis',
+        render: () => {
+          const sel = trace.selection.selection;
+          const area = sel.kind === 'area' ? sel : undefined;
+          return renderContent(area);
+        },
+      },
     });
+    trace.tabs.addDefaultTab(TAB_URI);
 
-    // Entry point 2: a standalone page reachable even with nothing selected.
+    // Standalone page reachable even with nothing selected (sidebar entry).
     trace.pages.registerPage({
       route: '/agent_analysis',
       render: () => m('.pf-agent-analysis-page', renderContent(undefined)),
