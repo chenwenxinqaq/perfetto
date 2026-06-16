@@ -114,6 +114,12 @@ export default class TimelinePlugin implements PerfettoPlugin {
         utidToMachine.set(it.utid, it.m);
       }
       trace.timeline.setMachineMaps(upidToMachine, utidToMachine);
+
+      // Diff workflow: when several traces are loaded together (each with its
+      // own machine_id), auto-align them up front by the start of each trace's
+      // first kernel on its first channel, so they're comparable immediately.
+      // The user can still refine manually (Align) or Reset afterwards.
+      await alignment.autoAlignByFirstKernel();
     });
 
     trace.commands.registerCommand({

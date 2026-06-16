@@ -25,6 +25,7 @@
 // no track SQL changes needed.
 
 import {type time, type duration, Time} from '../../base/time';
+import {LONG, NUM} from '../../trace_processor/query_result';
 import type {Size2D} from '../../base/geom';
 import type {TimeScale} from '../../base/time_scale';
 import {drawVerticalLineAtTime} from '../../base/vertical_line_helper';
@@ -82,6 +83,49 @@ export class TraceAlignmentController {
     this.anchorB = undefined;
     this._active = false;
     this.trace.timeline.clearTimeAlignment();
+  }
+
+  // Initial automatic alignment for the diff workflow: line every trace up by
+  // the start time of its FIRST kernel on its FIRST channel. Concretely, for
+  // each machine we take the earliest slice ts across that machine's tracks
+  // (that earliest ts necessarily lies on whichever channel started first), and
+  // shift each machine so all those first-kernel starts coincide with the
+  // earliest machine's. Runs once when multiple traces are loaded together;
+  // the user can still refine manually afterwards or Reset.
+  async autoAlignByFirstKernel(): Promise<void> {
+    const res = await this.trace.engine.query(`
+      INCLUDE PERFETTO MODULE slices.with_context;
+      SELECT
+        coalesce(
+          (SELECT machine_id FROM process WHERE upid = s.upid), 0) AS machine,
+        min(s.ts) AS first_ts
+      FROM thread_or_process_slice s
+      WHERE s.dur >= 0
+      GROUP BY machine
+      ORDER BY machine
+    `);
+    const firstTsByMachine = new Map<number, bigint>();
+    for (
+      const it = res.iter({machine: NUM, first_ts: LONG});
+      it.valid();
+      it.next()
+    ) {
+      firstTsByMachine.set(it.machine, it.first_ts);
+    }
+    // Need at least two traces (machines) for alignment to mean anything.
+    if (firstTsByMachine.size < 2) return;
+
+    // Reference = the machine whose first kernel starts earliest; every other
+    // machine is shifted left/right so its first kernel lands on the reference.
+    const reference = [...firstTsByMachine.values()].reduce((a, b) =>
+      a < b ? a : b,
+    );
+    for (const [machine, firstTs] of firstTsByMachine) {
+      const offset = (reference - firstTs) as duration;
+      if (offset !== 0n) {
+        this.trace.timeline.setMachineTimeOffset(machine, offset);
+      }
+    }
   }
 
   // Called every frame by the overlay while active: if the selection changed to

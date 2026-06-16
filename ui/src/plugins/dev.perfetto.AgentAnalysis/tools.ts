@@ -38,6 +38,15 @@ export type DownloadFn = (args: {
   mimeType: string;
 }) => void;
 
+// The user's CURRENT timeline selection, resolved to trace_processor track_ids
+// and a time window, so tools default to "what the user has selected" (e.g. a
+// single SSE-Channel track) instead of the whole trace. Returns undefined when
+// nothing useful is selected. Read fresh on each tool call (the selection
+// changes during a conversation), hence a callback rather than a static value.
+export type SelectionProvider = () =>
+  | {trackIds: ReadonlyArray<number>; startTs?: number; endTs?: number}
+  | undefined;
+
 // OpenAI-compatible function/tool definition (the `function` half).
 export interface ToolDef {
   readonly type: 'function';
@@ -61,6 +70,7 @@ export interface Tool {
 const RUN_SQL = 'run_perfetto_sql';
 const LIST_TRACES = 'list_loaded_traces';
 const COMPARE_SLICES = 'compare_slices_across_traces';
+const KERNEL_BREAKDOWN = 'kernel_cost_breakdown';
 const EXPORT_DATA = 'export_data_to_file';
 const MAX_ROWS = 2000;
 // Cap exported payloads so a runaway model can't try to write a huge blob.
@@ -225,15 +235,176 @@ async function compareSlicesAcrossTraces(
   return out;
 }
 
-// Builds the tool set for a trace. When several traces are loaded together for
-// comparison (each with its own machine_id), `alignment` lets the diff tools
-// report the user's manual time-alignment offsets. Pass undefined when no
-// alignment state is available (the diff tools still work, just without
-// offsets).
+// One leaf kernel's aggregated cost, tagged with module/stage so the model can
+// build the module -> stage -> kernel breakdown table (e.g. FA -> flash_attn /
+// reduce -> kernel, or MOE -> dispatch/topk/combine -> kernel). module/stage
+// come either from the slice nesting (ancestor depth) or from caller-supplied
+// name-matching rules, whichever fits the trace.
+interface KernelCostRow {
+  module: string; // Top group (e.g. FA / MOE), '' if unclassified.
+  stage: string; // Sub group (e.g. flash_attention / dispatch), '' if none.
+  kernel: string; // Leaf slice name (the kernel).
+  costUs: number; // Sum of this leaf kernel's duration (microseconds).
+  count: number; // Number of invocations.
+  pct: number; // Share of the total window cost (%).
+}
+
+// The breakdown plus the grand total so callers can show per-row percentages
+// and per-module/per-stage sums.
+interface KernelCostBreakdown {
+  totalUs: number;
+  rows: KernelCostRow[];
+}
+
+// A name-based classification rule: any leaf kernel whose name matches the GLOB
+// `pattern` is assigned to (module, stage). First matching rule wins, so order
+// rules from most to least specific. Used when kernels are flat under a track
+// (no ATTN/MOE parent slices to read module/stage from).
+interface GroupRule {
+  pattern: string; // GLOB matched against the kernel (leaf slice) name.
+  module: string;
+  stage?: string;
+}
+
+// Aggregates per-LEAF-kernel cost into a module -> stage -> kernel table.
+//
+// Two ways to derive module/stage, chosen by the caller:
+//  - rules: classify by the leaf kernel NAME (GLOB -> module/stage). Use this
+//    when kernels are flat under a track (the common XPU case, no ATTN/MOE
+//    parent slices). First matching rule wins.
+//  - otherwise: read module/stage from the slice NESTING (ancestor at
+//    moduleDepth / stageDepth).
+//
+// Restricts to leaf slices only (so parent/child time isn't double-summed), an
+// optional time window, machine (trace), explicit track_ids (defaults to the
+// user's selected tracks via the SelectionProvider in buildTools), and a
+// leaf-name GLOB. Rows come out in EXECUTION (time) order.
+async function kernelCostBreakdown(
+  engine: Engine,
+  opts: {
+    startTs?: number;
+    endTs?: number;
+    machine?: number;
+    trackIds?: ReadonlyArray<number>;
+    namePattern?: string;
+    moduleDepth: number;
+    stageDepth: number;
+    rules?: ReadonlyArray<GroupRule>;
+    limit: number;
+  },
+): Promise<KernelCostBreakdown> {
+  const safePattern = (opts.namePattern ?? '*').replace(/'/g, "''");
+  const conds: string[] = ['s.dur > 0', "s.name GLOB '" + safePattern + "'"];
+  if (opts.startTs !== undefined && opts.endTs !== undefined) {
+    // Overlap test: the slice intersects the [start, end] window.
+    conds.push(`s.ts < ${opts.endTs}`, `s.ts + s.dur > ${opts.startTs}`);
+  }
+  if (opts.trackIds !== undefined && opts.trackIds.length > 0) {
+    const ids = opts.trackIds.filter((n) => Number.isFinite(n)).join(',');
+    if (ids !== '') conds.push(`s.track_id IN (${ids})`);
+  }
+  if (opts.machine !== undefined) {
+    conds.push(
+      `coalesce((SELECT machine_id FROM process WHERE upid = s.upid), 0) = ` +
+        `${opts.machine}`,
+    );
+  }
+  const where = conds.join(' AND ');
+  const md = Math.trunc(opts.moduleDepth);
+  const sd = Math.trunc(opts.stageDepth);
+
+  // module/stage expressions: either a CASE over name rules, or ancestor slice
+  // names at the configured depths.
+  let moduleExpr: string;
+  let stageExpr: string;
+  if (opts.rules !== undefined && opts.rules.length > 0) {
+    const esc = (p: string) => p.replace(/'/g, "''");
+    const moduleCases = opts.rules
+      .map(
+        (r) => `WHEN l.kernel GLOB '${esc(r.pattern)}' THEN '${esc(r.module)}'`,
+      )
+      .join(' ');
+    const stageCases = opts.rules
+      .map(
+        (r) =>
+          `WHEN l.kernel GLOB '${esc(r.pattern)}' THEN '${esc(r.stage ?? '')}'`,
+      )
+      .join(' ');
+    moduleExpr = `CASE ${moduleCases} ELSE '' END`;
+    stageExpr = `CASE ${stageCases} ELSE '' END`;
+  } else {
+    moduleExpr =
+      `coalesce((SELECT a.name FROM ancestor_slice(l.id) a ` +
+      `WHERE a.depth = ${md}), '')`;
+    stageExpr =
+      `coalesce((SELECT a.name FROM ancestor_slice(l.id) a ` +
+      `WHERE a.depth = ${sd}), '')`;
+  }
+
+  // Leaf = a slice with no children (the actual kernel). We keep min(ts) per
+  // group and order by module-first-ts, then stage-first-ts, then
+  // kernel-first-ts so the table preserves EXECUTION order. sum(...) OVER () is
+  // the grand total across all groups (before LIMIT) so percentages stay right.
+  const res = await engine.query(`
+    INCLUDE PERFETTO MODULE slices.with_context;
+    WITH leaf AS (
+      SELECT s.id, s.name AS kernel, s.dur, s.ts
+      FROM thread_or_process_slice s
+      WHERE ${where}
+        AND NOT EXISTS (SELECT 1 FROM slice c WHERE c.parent_id = s.id)
+    ),
+    grouped AS (
+      SELECT
+        ${moduleExpr} AS module,
+        ${stageExpr} AS stage,
+        l.kernel AS kernel,
+        sum(l.dur) AS dur_ns,
+        count(*) AS cnt,
+        min(l.ts) AS first_ts
+      FROM leaf l
+      GROUP BY module, stage, kernel
+    )
+    SELECT
+      module,
+      stage,
+      kernel,
+      CAST(dur_ns / 1e3 AS REAL) AS cost_us,
+      cnt,
+      first_ts,
+      CAST(sum(dur_ns) OVER () / 1e3 AS REAL) AS total_us,
+      min(first_ts) OVER (PARTITION BY module) AS module_ts,
+      min(first_ts) OVER (PARTITION BY module, stage) AS stage_ts
+    FROM grouped
+    ORDER BY module_ts, stage_ts, first_ts
+    LIMIT ${opts.limit}
+  `);
+  const rows: KernelCostRow[] = [];
+  let totalUs = 0;
+  const it = res.iter({});
+  for (; it.valid(); it.next()) {
+    totalUs = Number(it.get('total_us'));
+    const costUs = Number(it.get('cost_us'));
+    rows.push({
+      module: String(it.get('module') ?? ''),
+      stage: String(it.get('stage') ?? ''),
+      kernel: String(it.get('kernel') ?? ''),
+      costUs,
+      count: Number(it.get('cnt')),
+      pct: totalUs > 0 ? Number(((costUs / totalUs) * 100).toFixed(2)) : 0,
+    });
+  }
+  return {totalUs: Number(totalUs.toFixed(3)), rows};
+}
+
+// Builds the tool set for a trace. `alignment` lets the diff tools report
+// manual cross-trace time offsets; `downloadFn` powers the export tool;
+// `selectionProvider` lets the kernel-breakdown tool default to the user's
+// CURRENT timeline selection (tracks + time window) instead of the whole trace.
 export function buildTools(
   engine: Engine,
   alignment?: AlignmentProvider,
   downloadFn?: DownloadFn,
+  selectionProvider?: SelectionProvider,
 ): Tool[] {
   const runSql: Tool = {
     def: {
@@ -356,6 +527,172 @@ export function buildTools(
     },
   };
 
+  // ---- Per-kernel cost breakdown (module -> stage -> kernel) --------------
+
+  const kernelBreakdown: Tool = {
+    def: {
+      type: 'function',
+      function: {
+        name: KERNEL_BREAKDOWN,
+        description:
+          "Build a MODULE -> STAGE -> kernel cost table for the user's " +
+          'CURRENT timeline selection. IMPORTANT: by default it uses exactly ' +
+          'the tracks AND time window the user selected (e.g. one ' +
+          'SSE-Channel), so you do NOT need to (and should not) pass ' +
+          'start_ts/end_ts/track_ids — leave them out to honour the ' +
+          'selection. Returns {totalUs, rows[]}; each row has module, stage, ' +
+          'kernel (leaf slice name), cost_us (busy time, microseconds), ' +
+          'count, pct (share of total). Only LEAF kernels are counted, so ' +
+          'parent/child time is never double-added. Rows come back in ' +
+          'EXECUTION (time) order — KEEP that order, do NOT re-sort by cost. ' +
+          'Grouping: if the kernels are FLAT under a track (no ATTN/MOE/FA ' +
+          'parent slices — the usual XPU case), pass `groups`: a list of ' +
+          '{pattern (kernel-name GLOB), module, stage} rules to classify ' +
+          'kernels by name (first match wins, order specific->general). E.g. ' +
+          '[{pattern:"*flash_attention_decoder_mtp*",module:"FA",stage:' +
+          '"flash_attention"},{pattern:"*reduce_decoder_computation_cluster*"' +
+          ',module:"FA",stage:"reduce"}]. If instead the trace DOES nest ' +
+          'kernels under module/stage parent slices, omit `groups` and it ' +
+          'reads module=ancestor depth module_depth (default 0), ' +
+          'stage=stage_depth (default 1). To override the selection, pass ' +
+          'track_ids and/or start_ts+end_ts explicitly. Per-module/stage ' +
+          'sum(us) = add cost_us across rows sharing that module/stage. Use ' +
+          'export_data_to_file to download the table as CSV.',
+        parameters: {
+          type: 'object',
+          properties: {
+            groups: {
+              type: 'array',
+              description:
+                'Name-based classification rules for flat kernels. First ' +
+                'match wins; order specific -> general.',
+              items: {
+                type: 'object',
+                properties: {
+                  pattern: {
+                    type: 'string',
+                    description: 'GLOB matched against the kernel name.',
+                  },
+                  module: {type: 'string', description: 'Module label.'},
+                  stage: {type: 'string', description: 'Stage label.'},
+                },
+                required: ['pattern', 'module'],
+              },
+            },
+            track_ids: {
+              type: 'array',
+              items: {type: 'number'},
+              description:
+                'Restrict to these trace_processor track_ids. Omit to use ' +
+                "the user's selected tracks.",
+            },
+            start_ts: {
+              type: 'number',
+              description:
+                "Window start (trace ns). Omit to use the user's selection.",
+            },
+            end_ts: {
+              type: 'number',
+              description:
+                "Window end (trace ns). Omit to use the user's selection.",
+            },
+            machine_id: {
+              type: 'number',
+              description:
+                'Restrict to one loaded trace (see list_loaded_traces).',
+            },
+            name_pattern: {
+              type: 'string',
+              description: 'Kernel-name GLOB pre-filter (default "*" = all).',
+            },
+            module_depth: {
+              type: 'number',
+              description:
+                'Ancestor depth for the module column when NOT using groups ' +
+                '(default 0).',
+            },
+            stage_depth: {
+              type: 'number',
+              description:
+                'Ancestor depth for the stage column when NOT using groups ' +
+                '(default 1).',
+            },
+            limit: {
+              type: 'number',
+              description: `Max rows (default 500, max ${MAX_ROWS}).`,
+            },
+          },
+        },
+      },
+    },
+    async run(args: Record<string, unknown>): Promise<ToolHandlerResult> {
+      const num = (v: unknown): number | undefined => {
+        if (v === undefined || v === null || v === '') return undefined;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      // Parse caller-supplied grouping rules (for flat kernels).
+      let rules: GroupRule[] | undefined;
+      if (Array.isArray(args.groups)) {
+        const parsed: GroupRule[] = [];
+        for (const g of args.groups as unknown[]) {
+          const o = (g ?? {}) as Record<string, unknown>;
+          const pattern = String(o.pattern ?? '').trim();
+          const module = String(o.module ?? '').trim();
+          if (pattern === '' || module === '') continue;
+          parsed.push({pattern, module, stage: String(o.stage ?? '').trim()});
+        }
+        if (parsed.length > 0) rules = parsed;
+      }
+
+      // Default the window/tracks to the user's current selection unless the
+      // caller explicitly overrode them.
+      const sel = selectionProvider?.();
+      let startTs = num(args.start_ts);
+      let endTs = num(args.end_ts);
+      let trackIds: ReadonlyArray<number> | undefined = Array.isArray(
+        args.track_ids,
+      )
+        ? (args.track_ids as unknown[])
+            .map((v) => Number(v))
+            .filter((n) => Number.isFinite(n))
+        : undefined;
+      let scope = 'whole trace';
+      const overrodeWindow = startTs !== undefined && endTs !== undefined;
+      const overrodeTracks = trackIds !== undefined && trackIds.length > 0;
+      if (sel !== undefined && !overrodeWindow && !overrodeTracks) {
+        startTs = sel.startTs ?? startTs;
+        endTs = sel.endTs ?? endTs;
+        trackIds = sel.trackIds.length > 0 ? sel.trackIds : trackIds;
+        scope = 'current selection';
+      } else if (overrodeTracks || overrodeWindow) {
+        scope = 'custom range';
+      }
+
+      const haveWindow = startTs !== undefined && endTs !== undefined;
+      const limit = Math.min(num(args.limit) ?? 500, MAX_ROWS);
+      const namePattern = String(args.name_pattern ?? '*').trim() || '*';
+      const result = await kernelCostBreakdown(engine, {
+        startTs: haveWindow ? startTs : undefined,
+        endTs: haveWindow ? endTs : undefined,
+        machine: num(args.machine_id),
+        trackIds,
+        namePattern,
+        moduleDepth: num(args.module_depth) ?? 0,
+        stageDepth: num(args.stage_depth) ?? 1,
+        rules,
+        limit,
+      });
+      return {
+        content: JSON.stringify(result),
+        summary:
+          `kernel cost breakdown (${scope}) → ${result.rows.length} ` +
+          `kernel${result.rows.length === 1 ? '' : 's'}, total ` +
+          `${result.totalUs.toFixed(1)}us`,
+      };
+    },
+  };
+
   // ---- Export / download tool ---------------------------------------------
 
   const exportData: Tool = {
@@ -440,7 +777,7 @@ export function buildTools(
     },
   };
 
-  return [runSql, listTraces, compareSlices, exportData];
+  return [runSql, listTraces, compareSlices, kernelBreakdown, exportData];
 }
 
-export {RUN_SQL, LIST_TRACES, COMPARE_SLICES, EXPORT_DATA};
+export {RUN_SQL, LIST_TRACES, COMPARE_SLICES, KERNEL_BREAKDOWN, EXPORT_DATA};

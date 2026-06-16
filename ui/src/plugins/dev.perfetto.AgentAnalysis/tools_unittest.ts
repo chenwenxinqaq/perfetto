@@ -173,6 +173,232 @@ describe('diff tools', () => {
   });
 });
 
+describe('kernel_cost_breakdown tool', () => {
+  function getTool(
+    engine: Engine,
+    selection?: Parameters<typeof buildTools>[3],
+  ) {
+    const tools = buildTools(engine, undefined, undefined, selection);
+    const tool = tools.find(
+      (t) => t.def.function.name === 'kernel_cost_breakdown',
+    );
+    expect(tool).toBeDefined();
+    return tool!;
+  }
+
+  it('is included in the tool set', () => {
+    const {engine} = fakeEngine();
+    const names = buildTools(engine).map((t) => t.def.function.name);
+    expect(names).toContain('kernel_cost_breakdown');
+  });
+
+  it('returns module/stage/kernel/cost rows with total and pct', async () => {
+    const {engine} = fakeEngineWithRows([
+      {
+        module: 'MOE',
+        stage: 'share expert',
+        kernel: 'fc_bf16',
+        cost_us: 250,
+        cnt: 3,
+        first_ts: 10,
+        total_us: 1000,
+      },
+      {
+        module: 'ATTN',
+        stage: '',
+        kernel: 'all_reduce',
+        cost_us: 750,
+        cnt: 1,
+        first_ts: 20,
+        total_us: 1000,
+      },
+    ]);
+    const tool = getTool(engine);
+    const res = await tool.run({});
+    const parsed = JSON.parse(res.content) as {
+      totalUs: number;
+      rows: Array<{
+        module: string;
+        stage: string;
+        kernel: string;
+        costUs: number;
+        pct: number;
+      }>;
+    };
+    expect(parsed.totalUs).toBe(1000);
+    expect(parsed.rows).toHaveLength(2);
+    expect(parsed.rows[0].module).toBe('MOE');
+    expect(parsed.rows[0].stage).toBe('share expert');
+    expect(parsed.rows[0].pct).toBe(25);
+    expect(parsed.rows[1].pct).toBe(75);
+    expect(res.summary).toContain('2 kernels');
+  });
+
+  it('orders rows by execution time, not by cost', async () => {
+    const {engine, calls} = fakeEngineWithRows([
+      {
+        module: '',
+        stage: '',
+        kernel: 'k',
+        cost_us: 1,
+        cnt: 1,
+        first_ts: 0,
+        total_us: 1,
+      },
+    ]);
+    const tool = getTool(engine);
+    await tool.run({});
+    // Module/stage/kernel come out in run order; never re-sorted by cost.
+    expect(calls[0]).toContain('ORDER BY module_ts, stage_ts, first_ts');
+    expect(calls[0]).not.toContain('ORDER BY cost_us');
+  });
+
+  it('counts only leaf slices (excludes parents with children)', async () => {
+    const {engine, calls} = fakeEngineWithRows([
+      {
+        module: '',
+        stage: '',
+        kernel: 'k',
+        cost_us: 1,
+        cnt: 1,
+        first_ts: 0,
+        total_us: 1,
+      },
+    ]);
+    const tool = getTool(engine);
+    await tool.run({});
+    expect(calls[0]).toContain('c.parent_id = s.id');
+  });
+
+  it('uses the given module_depth and stage_depth', async () => {
+    const {engine, calls} = fakeEngineWithRows([
+      {
+        module: '',
+        stage: '',
+        kernel: 'k',
+        cost_us: 1,
+        cnt: 1,
+        first_ts: 0,
+        total_us: 1,
+      },
+    ]);
+    const tool = getTool(engine);
+    await tool.run({module_depth: 2, stage_depth: 3});
+    expect(calls[0]).toContain('a.depth = 2');
+    expect(calls[0]).toContain('a.depth = 3');
+  });
+
+  it('only applies the time window when both bounds are given', async () => {
+    const {engine, calls} = fakeEngineWithRows([
+      {
+        module: '',
+        stage: '',
+        kernel: 'k',
+        cost_us: 1,
+        cnt: 1,
+        first_ts: 0,
+        total_us: 1,
+      },
+    ]);
+    const tool = getTool(engine);
+    // Only start_ts: no window clause should be emitted.
+    await tool.run({start_ts: 100});
+    expect(calls[0]).not.toContain('s.ts <');
+    // Both bounds: window overlap clause present.
+    await tool.run({start_ts: 100, end_ts: 200});
+    expect(calls[1]).toContain('s.ts < 200');
+    expect(calls[1]).toContain('s.ts + s.dur > 100');
+  });
+
+  it('escapes quotes in the kernel-name GLOB', async () => {
+    const {engine, calls} = fakeEngineWithRows([
+      {module: '', stage: '', kernel: 'k', cost_us: 1, cnt: 1, total_us: 1},
+    ]);
+    const tool = getTool(engine);
+    await tool.run({name_pattern: "x' OR '1'='1"});
+    expect(calls[0]).toContain("x'' OR ''1''=''1");
+  });
+
+  it('defaults to the user selection (track_ids + window)', async () => {
+    const {engine, calls} = fakeEngineWithRows([
+      {
+        module: '',
+        stage: '',
+        kernel: 'k',
+        cost_us: 1,
+        cnt: 1,
+        first_ts: 0,
+        total_us: 1,
+      },
+    ]);
+    const tool = getTool(engine, () => ({
+      trackIds: [27],
+      startTs: 100,
+      endTs: 200,
+    }));
+    const res = await tool.run({}); // no args -> use selection
+    expect(calls[0]).toContain('s.track_id IN (27)');
+    expect(calls[0]).toContain('s.ts < 200');
+    expect(calls[0]).toContain('s.ts + s.dur > 100');
+    expect(res.summary).toContain('current selection');
+  });
+
+  it('explicit track_ids override the selection', async () => {
+    const {engine, calls} = fakeEngineWithRows([
+      {
+        module: '',
+        stage: '',
+        kernel: 'k',
+        cost_us: 1,
+        cnt: 1,
+        first_ts: 0,
+        total_us: 1,
+      },
+    ]);
+    const tool = getTool(engine, () => ({
+      trackIds: [27],
+      startTs: 1,
+      endTs: 2,
+    }));
+    await tool.run({track_ids: [99]});
+    expect(calls[0]).toContain('s.track_id IN (99)');
+    expect(calls[0]).not.toContain('s.track_id IN (27)');
+  });
+
+  it('classifies flat kernels by name via groups (first match wins)', async () => {
+    const {engine, calls} = fakeEngineWithRows([
+      {
+        module: 'FA',
+        stage: 'flash',
+        kernel: 'k',
+        cost_us: 1,
+        cnt: 1,
+        first_ts: 0,
+        total_us: 1,
+      },
+    ]);
+    const tool = getTool(engine);
+    await tool.run({
+      groups: [
+        {
+          pattern: '*flash_attention_decoder_mtp*',
+          module: 'FA',
+          stage: 'flash',
+        },
+        {
+          pattern: '*reduce_decoder_computation_cluster*',
+          module: 'FA',
+          stage: 'reduce',
+        },
+      ],
+    });
+    // A CASE over the kernel name, not ancestor_slice depth lookups.
+    expect(calls[0]).toContain('CASE WHEN l.kernel GLOB');
+    expect(calls[0]).toContain("THEN 'FA'");
+    expect(calls[0]).not.toContain('ancestor_slice');
+  });
+});
+
 describe('export_data_to_file tool', () => {
   function getExportTool(
     engine: Engine,

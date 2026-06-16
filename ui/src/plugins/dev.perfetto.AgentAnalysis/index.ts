@@ -40,10 +40,20 @@ When the user loaded several traces together for comparison (via "Open traces
 for comparison (diff)"), each trace has its own machine_id: call
 list_loaded_traces first to see how many traces there are, and use
 compare_slices_across_traces to diff the same operation between runs before
-drilling in with run_perfetto_sql. When the user asks to save, export, or
-download data you collected or compared, call export_data_to_file with the full
-content (CSV for tables, JSON for nested data) instead of only pasting it into
-the chat. Be concise and avoid inventing facts not supported by the data.`;
+drilling in with run_perfetto_sql. For a per-kernel cost table broken down by
+module and stage (e.g. FA/MOE -> flash_attention/reduce/dispatch/topk/... ->
+each kernel's cost(us), with per-module/stage sums and percentages), use
+kernel_cost_breakdown rather than writing SQL by hand. It defaults to the
+user's CURRENT selection (their selected tracks AND time window), so for "the
+selected channel/region" just call it with no track_ids/start_ts/end_ts. If the
+kernels are flat under the track (no parent module slices — the usual XPU
+case), pass a "groups" list (kernel-name GLOB -> module/stage rules) to classify
+them; otherwise it reads module/stage from slice nesting. Keep the returned rows
+in their given EXECUTION-time order — never re-sort the table by cost. When the
+user asks to save, export, or download data you collected or compared, call
+export_data_to_file with the full content (CSV for tables, JSON for nested
+data) instead of only pasting it into the chat. Be concise and avoid inventing
+facts not supported by the data.`;
 
 export default class AgentAnalysisPlugin implements PerfettoPlugin {
   static readonly id = 'dev.perfetto.AgentAnalysis';
@@ -138,12 +148,34 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
           machineTimeOffset: (m) => trace.timeline.machineTimeOffset(m),
         },
         (a) =>
+          // No filePicker: the native save dialog (showSaveFilePicker) needs a
+          // user gesture, but this fires from the async agent loop (no click),
+          // so it would throw and silently no-op. The anchor-download fallback
+          // works without a gesture and reliably saves the file.
           download({
             content: a.content,
             fileName: a.fileName,
             mimeType: a.mimeType,
-            filePicker: {},
           }),
+        // Default tools (e.g. kernel_cost_breakdown) to the user's CURRENT area
+        // selection: its time window and the trace_processor track_ids behind
+        // the selected UI tracks (one UI track can map to several sql track_ids;
+        // non-slice tracks contribute none). Read fresh each call.
+        () => {
+          const sel = trace.selection.selection;
+          if (sel.kind !== 'area') return undefined;
+          const trackIds: number[] = [];
+          for (const t of sel.tracks) {
+            const rootTable = t.renderer?.rootTableName;
+            if (rootTable !== undefined && rootTable !== 'slice') continue;
+            for (const id of t.tags?.trackIds ?? []) trackIds.push(id);
+          }
+          return {
+            trackIds,
+            startTs: Number(sel.start),
+            endTs: Number(sel.end),
+          };
+        },
       ),
     });
     trace.trash.defer(() => conversation.dispose());
