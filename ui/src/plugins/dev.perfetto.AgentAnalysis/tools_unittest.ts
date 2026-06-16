@@ -31,6 +31,31 @@ function fakeEngine(): {engine: Engine; calls: string[]} {
   return {engine, calls};
 }
 
+// A fake engine returning a fixed set of rows for every query.
+function fakeEngineWithRows(rows: ReadonlyArray<Record<string, unknown>>): {
+  engine: Engine;
+  calls: string[];
+} {
+  const calls: string[] = [];
+  const engine = {
+    query: vi.fn(async (q: string) => {
+      calls.push(q);
+      let i = 0;
+      return {
+        columns: () => Object.keys(rows[0] ?? {}),
+        iter: () => ({
+          valid: () => i < rows.length,
+          next: () => {
+            i++;
+          },
+          get: (c: string) => rows[i]?.[c] ?? null,
+        }),
+      };
+    }),
+  } as unknown as Engine;
+  return {engine, calls};
+}
+
 describe('run_perfetto_sql tool', () => {
   function runSql(engine: Engine) {
     const tools = buildTools(engine);
@@ -77,5 +102,136 @@ describe('run_perfetto_sql tool', () => {
       tool.run({query: '-- harmless\nDROP TABLE slice'}),
     ).rejects.toThrow();
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe('diff tools', () => {
+  function getTool(engine: Engine, name: string, alignment?: unknown) {
+    const tools = buildTools(
+      engine,
+      alignment as Parameters<typeof buildTools>[1],
+    );
+    const tool = tools.find((t) => t.def.function.name === name);
+    expect(tool).toBeDefined();
+    return tool!;
+  }
+
+  it('exposes list_loaded_traces and compare_slices_across_traces', () => {
+    const {engine} = fakeEngine();
+    const names = buildTools(engine).map((t) => t.def.function.name);
+    expect(names).toContain('list_loaded_traces');
+    expect(names).toContain('compare_slices_across_traces');
+  });
+
+  it('list_loaded_traces returns one row per machine', async () => {
+    const {engine} = fakeEngineWithRows([
+      {machine: 0, process_count: 3, slice_count: 100, min_ts: 10, max_ts: 90},
+      {machine: 1, process_count: 4, slice_count: 200, min_ts: 5, max_ts: 80},
+    ]);
+    const tool = getTool(engine, 'list_loaded_traces');
+    const res = await tool.run({});
+    const parsed = JSON.parse(res.content) as Array<{machine: number}>;
+    expect(parsed).toHaveLength(2);
+    expect(parsed[1].machine).toBe(1);
+    expect(res.summary).toContain('2 traces');
+  });
+
+  it('compare_slices_across_traces requires a name pattern', async () => {
+    const {engine, calls} = fakeEngine();
+    const tool = getTool(engine, 'compare_slices_across_traces');
+    const res = await tool.run({name_pattern: '  '});
+    expect(res.content).toContain('required');
+    expect(calls).toHaveLength(0); // never queried
+  });
+
+  it('compare_slices_across_traces escapes quotes in the GLOB pattern', async () => {
+    const {engine, calls} = fakeEngineWithRows([
+      {machine: 0, cnt: 5, total_ms: 50, avg_ms: 10, max_ms: 20},
+    ]);
+    const tool = getTool(engine, 'compare_slices_across_traces');
+    await tool.run({name_pattern: "evil' OR '1'='1"});
+    // The single quote must be doubled so it can't break out of the literal.
+    expect(calls[0]).toContain("evil'' OR ''1''=''1");
+  });
+
+  it('compare_slices_across_traces attaches alignment offsets', async () => {
+    const {engine} = fakeEngineWithRows([
+      {machine: 0, cnt: 5, total_ms: 50, avg_ms: 10, max_ms: 20},
+      {machine: 1, cnt: 6, total_ms: 70, avg_ms: 11, max_ms: 25},
+    ]);
+    const alignment = {
+      machineTimeOffset: (m: number) => (m === 1 ? 123n : undefined),
+    };
+    const tool = getTool(engine, 'compare_slices_across_traces', alignment);
+    const res = await tool.run({name_pattern: 'Step*'});
+    const parsed = JSON.parse(res.content) as Array<{
+      machine: number;
+      alignOffsetNs?: number;
+    }>;
+    expect(parsed[0].alignOffsetNs).toBeUndefined();
+    expect(parsed[1].alignOffsetNs).toBe(123);
+  });
+});
+
+describe('export_data_to_file tool', () => {
+  function getExportTool(
+    engine: Engine,
+    downloadFn?: Parameters<typeof buildTools>[2],
+  ) {
+    const tools = buildTools(engine, undefined, downloadFn);
+    const tool = tools.find(
+      (t) => t.def.function.name === 'export_data_to_file',
+    );
+    expect(tool).toBeDefined();
+    return tool!;
+  }
+
+  it('is included in the tool set', () => {
+    const {engine} = fakeEngine();
+    const names = buildTools(engine).map((t) => t.def.function.name);
+    expect(names).toContain('export_data_to_file');
+  });
+
+  it('passes content and file name through to the download fn', async () => {
+    const {engine} = fakeEngine();
+    const saved: Array<{content: string; fileName: string; mimeType: string}> =
+      [];
+    const tool = getExportTool(engine, (a) => saved.push(a));
+    const res = await tool.run({
+      file_name: 'data.csv',
+      content: 'a,b\n1,2\n',
+      format: 'csv',
+    });
+    expect(saved).toHaveLength(1);
+    expect(saved[0].fileName).toBe('data.csv');
+    expect(saved[0].content).toBe('a,b\n1,2\n');
+    expect(saved[0].mimeType).toBe('text/csv');
+    expect(res.summary).toContain('exported');
+  });
+
+  it('appends an extension matching the format when missing', async () => {
+    const {engine} = fakeEngine();
+    const saved: Array<{fileName: string}> = [];
+    const tool = getExportTool(engine, (a) => saved.push(a));
+    await tool.run({file_name: 'metrics', content: '{}', format: 'json'});
+    expect(saved[0].fileName).toBe('metrics.json');
+  });
+
+  it('rejects empty content without downloading', async () => {
+    const {engine} = fakeEngine();
+    let called = false;
+    const tool = getExportTool(engine, () => {
+      called = true;
+    });
+    const res = await tool.run({file_name: 'x.csv', content: ''});
+    expect(called).toBe(false);
+    expect(res.content).toContain('empty');
+  });
+
+  it('reports gracefully when downloading is unavailable', async () => {
+    const {engine} = fakeEngine();
+    const tool = getExportTool(engine, undefined);
+    const res = await tool.run({file_name: 'x.csv', content: 'a'});
+    expect(res.content).toContain('not available');
   });
 });

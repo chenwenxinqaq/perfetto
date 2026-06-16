@@ -23,6 +23,7 @@ import type {Setting} from '../../public/settings';
 import type {Trace} from '../../public/trace';
 import {Button, ButtonVariant} from '../../widgets/button';
 import {Intent} from '../../widgets/common';
+import {download} from '../../base/download_utils';
 import {AnalysisPanel} from './analysis_panel';
 import {Conversation} from './conversation';
 import {ConversationHistoryStore} from './history_store';
@@ -35,7 +36,14 @@ Given a selected time range and compact SQL summaries, explain what happened,
 call out suspicious performance issues, and suggest concrete next queries or UI
 checks. You can call the run_perfetto_sql tool to query the trace directly with
 read-only PerfettoSQL — prefer verifying claims with real data over guessing.
-Be concise and avoid inventing facts not supported by the data.`;
+When the user loaded several traces together for comparison (via "Open traces
+for comparison (diff)"), each trace has its own machine_id: call
+list_loaded_traces first to see how many traces there are, and use
+compare_slices_across_traces to diff the same operation between runs before
+drilling in with run_perfetto_sql. When the user asks to save, export, or
+download data you collected or compared, call export_data_to_file with the full
+content (CSV for tables, JSON for nested data) instead of only pasting it into
+the chat. Be concise and avoid inventing facts not supported by the data.`;
 
 export default class AgentAnalysisPlugin implements PerfettoPlugin {
   static readonly id = 'dev.perfetto.AgentAnalysis';
@@ -121,7 +129,22 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
         trace.workspaces.currentWorkspace.flatTracks.find((t) => t.uri === uri)
           ?.name ?? uri,
       store: new ConversationHistoryStore(trace.traceInfo.uuid),
-      tools: buildTools(trace.engine),
+      // Pass the timeline as the alignment provider so the diff tools can
+      // report any manual cross-trace time-alignment offsets the user applied.
+      // The export tool downloads collected/compared data to the user's machine.
+      tools: buildTools(
+        trace.engine,
+        {
+          machineTimeOffset: (m) => trace.timeline.machineTimeOffset(m),
+        },
+        (a) =>
+          download({
+            content: a.content,
+            fileName: a.fileName,
+            mimeType: a.mimeType,
+            filePicker: {},
+          }),
+      ),
     });
     trace.trash.defer(() => conversation.dispose());
 

@@ -21,6 +21,20 @@ you press **Send**.
   real data instead of guessing. Tool calls are shown inline in the transcript
   ("🔧 SQL: … → N rows"). Only `SELECT` / `WITH` / `INCLUDE PERFETTO MODULE`
   statements are allowed; results are capped to keep them summarisable.
+- **Diff / multi-trace tools**: when several traces are opened together via
+  "Open traces for comparison (diff)" (each gets its own `machine_id`), the
+  agent gets two extra tools:
+  - `list_loaded_traces` — one row per loaded trace (machine id, process /
+    slice counts, ts bounds). A single ordinary trace returns one row
+    (`machine=0`).
+  - `compare_slices_across_traces` — given a slice-name GLOB, returns per-trace
+    count and total/avg/max duration so the agent can A/B the same operation
+    across runs. If the user manually aligned the traces (timeline "Align"
+    tool), each row also carries the applied `alignOffsetNs`.
+- **Export tool**: `export_data_to_file` lets the agent download data it
+  collected or compared to the user's machine (CSV for tables, JSON for nested
+  data). Ask the agent to "export/save/download" a result and it writes a file
+  via the browser's save dialog instead of only pasting the data into the chat.
 - Selection summaries are restricted to the **selected tracks** (their
   trace_processor `track_id`s), so selecting different tracks yields different
   summaries.
