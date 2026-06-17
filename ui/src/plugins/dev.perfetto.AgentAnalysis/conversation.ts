@@ -26,11 +26,12 @@ import type {
   ConversationHistoryStore,
   SavedConversation,
 } from './history_store';
+import type {AgentLogStore} from './agent_log';
 import type {LlmClient, LlmMessage} from './llm_client';
 import type {Tool} from './tools';
 
 // Cap on agentic tool-call rounds per user message, to bound cost / loops.
-const MAX_TOOL_ROUNDS = 8;
+const MAX_TOOL_ROUNDS = 30;
 
 // A trace region the user attached to their next message, shown as a chip.
 export interface SelectionChip {
@@ -58,6 +59,8 @@ export interface ConversationDeps {
   readonly store: ConversationHistoryStore;
   // The tools the agent may call (e.g. run_perfetto_sql).
   readonly tools: ReadonlyArray<Tool>;
+  // Records each send() round (request, tool calls, timings) for inspection.
+  readonly log: AgentLogStore;
   // Render-time cross-trace alignment offset (ns) applied to an area's tracks,
   // so selection summaries can convert the display window back to real ts.
   // Returns 0n when the selection's trace isn't aligned. Optional (single-trace
@@ -245,10 +248,20 @@ export class Conversation {
       this.deps.tools.map((t) => [t.def.function.name, t]),
     );
 
+    // Open a log round capturing what we send and what the tools return, so the
+    // agent loop is inspectable / exportable instead of a black box.
+    const logger = this.deps.log.startRound({
+      model,
+      systemPrompt: this.deps.client.systemPrompt,
+      userText: llmContent,
+    });
+    logger.setRequest(messages);
+
     try {
       // Agentic loop: stream a turn; if the model asked for tools, run them,
       // feed results back, and continue. Stop when a turn has no tool calls.
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        logger.incRounds();
         let toolCalls: ReadonlyArray<{
           id: string;
           name: string;
@@ -282,9 +295,12 @@ export class Conversation {
           const tool = toolByName.get(call.name);
           let resultContent: string;
           let note: string;
+          let isError = false;
+          const callStart = Date.now();
           if (tool === undefined) {
             resultContent = `Error: unknown tool "${call.name}".`;
             note = `unknown tool ${call.name}`;
+            isError = true;
           } else {
             try {
               const args = JSON.parse(call.arguments || '{}') as Record<
@@ -297,8 +313,17 @@ export class Conversation {
             } catch (e: unknown) {
               resultContent = `Error: ${String(e)}`;
               note = `error: ${String(e)}`;
+              isError = true;
             }
           }
+          logger.addToolCall({
+            name: call.name,
+            arguments: call.arguments,
+            resultSummary: note,
+            resultPreview: resultContent,
+            durationMs: Date.now() - callStart,
+            isError,
+          });
           (assistant.toolNotes ??= []).push(note);
           messages.push({
             role: 'tool',
@@ -316,9 +341,13 @@ export class Conversation {
       if ((e as {name?: string}).name !== 'AbortError') {
         assistant.text = `Error: ${String(e)}`;
         assistant.isError = true;
+        logger.setError(String(e));
+      } else {
+        logger.setError('aborted');
       }
     } finally {
       this.isLoading = false;
+      logger.commit(assistant.text);
       this.persist();
       m.redraw();
     }

@@ -27,6 +27,7 @@ import {download} from '../../base/download_utils';
 import {AnalysisPanel} from './analysis_panel';
 import {Conversation} from './conversation';
 import {ConversationHistoryStore} from './history_store';
+import {AgentLogStore} from './agent_log';
 import {LlmClient} from './llm_client';
 import {pickProfilePrompt} from './profiles';
 import {buildTools} from './tools';
@@ -157,6 +158,7 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
 
     // One conversation per trace, so history survives selection changes and
     // panel remounts. Saved conversations are keyed by the trace uuid.
+    const agentLog = new AgentLogStore(trace.traceInfo.uuid);
     const conversation = new Conversation({
       engine: trace.engine,
       client: makeClient(),
@@ -165,6 +167,7 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
         trace.workspaces.currentWorkspace.flatTracks.find((t) => t.uri === uri)
           ?.name ?? uri,
       store: new ConversationHistoryStore(trace.traceInfo.uuid),
+      log: agentLog,
       // Pass the timeline as the alignment provider so the diff tools can
       // report any manual cross-trace time-alignment offsets the user applied.
       // The export tool downloads collected/compared data to the user's machine.
@@ -250,6 +253,7 @@ export default class AgentAnalysisPlugin implements PerfettoPlugin {
         selection,
         modelSetting: AgentAnalysisPlugin.modelSetting,
         conversation,
+        log: agentLog,
       });
     };
 

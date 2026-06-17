@@ -127,7 +127,13 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
-    scroll-behavior: smooth;
+    // NOTE: deliberately NOT `scroll-behavior: smooth`. While streaming we set
+    // scrollTop on every token; smooth scrolling animates each of those jumps
+    // and they pile up / fight each other, which is exactly the jank the user
+    // hit when scrolling up. Instant scroll keeps it smooth. Also isolate
+    // layout/paint so growing the transcript doesn't reflow the rest of the UI.
+    contain: layout paint;
+    overscroll-behavior: contain;
   }
 
   &__empty {
@@ -135,6 +141,108 @@
     text-align: center;
     color: var(--pf-color-text-muted, #777);
     max-width: 420px;
+  }
+
+  // ---- Agent debug log -----------------------------------------------------
+  &__log-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--pf-color-border, #ddd);
+  }
+
+  &__log-count {
+    font-size: 12px;
+    color: var(--pf-color-text-muted, #777);
+  }
+
+  &__log-round {
+    border: 1px solid var(--pf-color-border, #ddd);
+    border-radius: 4px;
+    padding: 4px 8px;
+    background: var(--pf-color-surface, #fff);
+
+    &--error {
+      border-color: var(--pf-color-danger, #c00);
+    }
+  }
+
+  &__log-summary {
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    user-select: none;
+  }
+
+  &__log-time {
+    font-variant-numeric: tabular-nums;
+    color: var(--pf-color-text-muted, #777);
+  }
+
+  &__log-model {
+    font-family: var(--pf-font-mono, monospace);
+    font-weight: 600;
+  }
+
+  &__log-meta {
+    color: var(--pf-color-text-muted, #777);
+  }
+
+  &__log-badge {
+    margin-left: auto;
+    color: var(--pf-color-danger, #c00);
+    font-weight: 600;
+  }
+
+  &__log-section-title {
+    margin-top: 8px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--pf-color-text-muted, #777);
+  }
+
+  &__log-pre {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    margin: 2px 0;
+    padding: 6px 8px;
+    background: var(--pf-color-background, #f5f5f5);
+    border-radius: 3px;
+    font-family: var(--pf-font-mono, monospace);
+    font-size: 11px;
+    max-height: 240px;
+    overflow-y: auto;
+  }
+
+  &__log-tool {
+    margin: 4px 0;
+    padding-left: 8px;
+    border-left: 3px solid var(--pf-color-border, #ccc);
+
+    &--error {
+      border-left-color: var(--pf-color-danger, #c00);
+    }
+  }
+
+  &__log-tool-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  &__log-tool-time {
+    color: var(--pf-color-text-muted, #777);
+    font-variant-numeric: tabular-nums;
+  }
+
+  &__log-none {
+    font-size: 12px;
+    color: var(--pf-color-text-muted, #777);
   }
 
   &__hint {
