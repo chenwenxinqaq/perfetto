@@ -49,6 +49,45 @@ const FALLBACK_MODELS = [
   'gpt-5.4',
 ];
 
+// Quick-prompt suggestions shown as clickable chips above the input box, to
+// give the user a starting point instead of a blank field. Clicking one fills
+// the composer (the user can edit before sending). Phrased to drive the
+// kernel-cost / breakdown tools.
+const PROMPT_SUGGESTIONS: ReadonlyArray<{label: string; prompt: string}> = [
+  {
+    label: 'Kernel cost table',
+    prompt:
+      'Give me a per-step kernel cost table (module → stage → kernel) for ' +
+      'the selected region, in execution order, and export it as CSV.',
+  },
+  {
+    label: 'Top time consumers',
+    prompt:
+      'What are the top time-consuming kernels in the selected region? ' +
+      'Break the cost down by module and stage.',
+  },
+  {
+    label: 'Step latency',
+    prompt:
+      'What is the end-to-end step latency here (earliest kernel start to ' +
+      'latest kernel end across all channels), and which channel defines ' +
+      'the tail?',
+  },
+  {
+    label: 'cluster vs sdnn overlap',
+    prompt:
+      'Are the cluster and sdnn compute units well overlapped in the ' +
+      'selected region, or are there intervals where only one is busy?',
+  },
+  {
+    label: 'Communication / stragglers',
+    prompt:
+      'Summarise the communication (all_reduce / all_gather / dispatch / ' +
+      'combine) cost in the selection and whether any collective looks like ' +
+      'it is waiting on a slow peer.',
+  },
+];
+
 // Formats a past timestamp as a compact relative string ("5 min ago").
 function timeAgo(ts: number): string {
   const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
@@ -479,6 +518,28 @@ export class AnalysisPanel implements m.ClassComponent<AnalysisPanelAttrs> {
       (conversation.input.trim() !== '' || conversation.pending.length > 0);
     return m(
       '.pf-agent-analysis__composer',
+      // Quick-prompt suggestion chips: only when the input is empty and we're
+      // idle, so they act as a starting point without getting in the way once
+      // the user starts typing or a conversation is under way.
+      conversation.input.trim() === '' &&
+        !conversation.isLoading &&
+        m(
+          '.pf-agent-analysis__suggestions',
+          PROMPT_SUGGESTIONS.map((s) =>
+            m(
+              'button.pf-agent-analysis__suggestion',
+              {
+                key: s.label,
+                title: s.prompt,
+                onclick: () => {
+                  conversation.input = s.prompt;
+                },
+              },
+              m(Icon, {icon: 'bolt'}),
+              s.label,
+            ),
+          ),
+        ),
       conversation.pending.length > 0 &&
         m(
           '.pf-agent-analysis__pending-chips',
@@ -519,17 +580,27 @@ export class AnalysisPanel implements m.ClassComponent<AnalysisPanelAttrs> {
             }
           },
         }),
-        m(Button, {
-          icon: 'send',
-          title: 'Send (Enter)',
-          disabled: !canSend,
-          intent: Intent.Primary,
-          variant: ButtonVariant.Filled,
-          onclick: () => {
-            this.autoScroll = true;
-            conversation.send(model);
-          },
-        }),
+        // While a run is in flight show a Stop button (abort the agent loop)
+        // instead of Send, so a stuck/looping request can always be cancelled.
+        conversation.isLoading
+          ? m(Button, {
+              icon: 'stop',
+              title: 'Stop',
+              intent: Intent.Danger,
+              variant: ButtonVariant.Filled,
+              onclick: () => conversation.stop(),
+            })
+          : m(Button, {
+              icon: 'send',
+              title: 'Send (Enter)',
+              disabled: !canSend,
+              intent: Intent.Primary,
+              variant: ButtonVariant.Filled,
+              onclick: () => {
+                this.autoScroll = true;
+                conversation.send(model);
+              },
+            }),
       ),
     );
   }

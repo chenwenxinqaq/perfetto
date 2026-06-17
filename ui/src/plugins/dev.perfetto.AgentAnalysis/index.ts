@@ -44,16 +44,34 @@ When the user loaded several traces together for comparison (via "Open traces
 for comparison (diff)"), each trace has its own machine_id: call
 list_loaded_traces first to see how many traces there are, and use
 compare_slices_across_traces to diff the same operation between runs before
-drilling in with run_perfetto_sql. For a per-kernel cost table broken down by
-module and stage (e.g. FA/MOE -> flash_attention/reduce/dispatch/topk/... ->
-each kernel's cost(us), with per-module/stage sums and percentages), use
-kernel_cost_breakdown rather than writing SQL by hand. It defaults to the
-user's CURRENT selection (their selected tracks AND time window), so for "the
-selected channel/region" just call it with no track_ids/start_ts/end_ts. If the
-kernels are flat under the track (no parent module slices — the usual XPU
-case), pass a "groups" list (kernel-name GLOB -> module/stage rules) to classify
-them; otherwise it reads module/stage from slice nesting. Keep the returned rows
-in their given EXECUTION-time order — never re-sort the table by cost. When the
+drilling in with run_perfetto_sql.
+
+CLASSIFYING KERNELS BY MODEL STRUCTURE — the preferred workflow for any
+"per-kernel cost / breakdown / 耗时表" request, so classification is consistent
+and complete (never hand-classify inside SQL, which is inconsistent and dumps
+half the kernels into "Other"):
+1. Call list_kernels to get the DISTINCT leaf kernels in the selection, in
+   execution order (name, count, totalUs, avgUs, firstTs).
+2. Identify the model. If the user gave a model name use it; if not, ASK the
+   user which model this trace is (e.g. deepseek_v2, qwen3_moe). Then call
+   list_vllm_models to get the real list of available model files, MATCH the
+   user's (free-form) name against that list yourself — handle aliases, casing
+   and version differences (e.g. "DeepSeek-V3" -> "deepseek_v3", "qwen3 moe" ->
+   "qwen3_moe") — and call fetch_model_structure(model_name) with the exact
+   matched base name to pull the architecture (class hierarchy, submodule
+   wiring, forward() order). If nothing plausibly matches, ask the user.
+3. Using the architecture + your knowledge, assign EACH distinct kernel name to
+   a (module, stage) — map every name (use "Other" only as a true last resort).
+   Mapping is by the leaf kernel NAME, so it stays identical across steps.
+4. Call kernel_cost_breakdown with groups = one rule per kernel where pattern is
+   the EXACT kernel name (no wildcards) and module/stage are your labels. It
+   aggregates deterministically, leaf-only, in execution order, with per-row
+   pct. The classification is now consistent across every step.
+For a quick breakdown without model structure you may still call
+kernel_cost_breakdown directly (it defaults to the user's CURRENT selection —
+tracks AND time window — so omit track_ids/start_ts/end_ts), but prefer the
+structure-driven path for quality. Keep returned rows in EXECUTION-time order —
+never re-sort the table by cost. When the
 user asks to save, export, or download data you collected or compared, call
 export_data_to_file with the full content (CSV for tables, JSON for nested
 data) instead of only pasting it into the chat. Be concise and avoid inventing

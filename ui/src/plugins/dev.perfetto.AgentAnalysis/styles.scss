@@ -393,6 +393,37 @@
     gap: 6px;
   }
 
+  // Quick-prompt suggestion chips above the input box.
+  &__suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  &__suggestion {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    cursor: pointer;
+    background: var(--pf-color-background, rgba(0, 0, 0, 0.04));
+    color: var(--pf-color-foreground, inherit);
+    border: 1px solid var(--pf-color-border, rgba(0, 0, 0, 0.15));
+
+    .pf-icon {
+      font-size: 14px;
+      opacity: 0.7;
+    }
+
+    &:hover {
+      background: var(--pf-color-primary-faint, rgba(51, 103, 214, 0.15));
+      border-color: var(--pf-color-primary, #3367d6);
+      color: var(--pf-color-primary, #3367d6);
+    }
+  }
+
   &__msg-chips {
     margin-bottom: 6px;
   }

@@ -71,10 +71,15 @@ const RUN_SQL = 'run_perfetto_sql';
 const LIST_TRACES = 'list_loaded_traces';
 const COMPARE_SLICES = 'compare_slices_across_traces';
 const KERNEL_BREAKDOWN = 'kernel_cost_breakdown';
+const LIST_KERNELS = 'list_kernels';
+const LIST_MODELS = 'list_vllm_models';
+const MODEL_STRUCTURE = 'fetch_model_structure';
 const EXPORT_DATA = 'export_data_to_file';
 const MAX_ROWS = 2000;
 // Cap exported payloads so a runaway model can't try to write a huge blob.
 const MAX_EXPORT_CHARS = 5_000_000;
+// Cap the model-structure summary fed back to the model.
+const MAX_STRUCTURE_CHARS = 24_000;
 
 // Only allow read-only statements. trace_processor SQL is powerful (CREATE
 // PERFETTO TABLE, etc.), but the agent should not mutate session state.
@@ -394,6 +399,235 @@ async function kernelCostBreakdown(
     });
   }
   return {totalUs: Number(totalUs.toFixed(3)), rows};
+}
+
+// One distinct leaf-kernel name within a window, with how often it ran, its
+// total/avg cost and when it first appeared. This is the small, deduped list a
+// model can classify by name against a known architecture.
+interface KernelListRow {
+  kernel: string;
+  count: number;
+  totalUs: number;
+  avgUs: number;
+  firstTs: number;
+}
+
+// Enumerates the DISTINCT leaf kernels in the window/tracks, ordered by first
+// appearance (execution order). Leaf-only so parent/child time isn't mixed in.
+async function listKernels(
+  engine: Engine,
+  opts: {
+    startTs?: number;
+    endTs?: number;
+    machine?: number;
+    trackIds?: ReadonlyArray<number>;
+    limit: number;
+  },
+): Promise<KernelListRow[]> {
+  const conds: string[] = ['s.dur > 0'];
+  if (opts.startTs !== undefined && opts.endTs !== undefined) {
+    conds.push(`s.ts < ${opts.endTs}`, `s.ts + s.dur > ${opts.startTs}`);
+  }
+  if (opts.trackIds !== undefined && opts.trackIds.length > 0) {
+    const ids = opts.trackIds.filter((n) => Number.isFinite(n)).join(',');
+    if (ids !== '') conds.push(`s.track_id IN (${ids})`);
+  }
+  if (opts.machine !== undefined) {
+    conds.push(
+      `coalesce((SELECT machine_id FROM process WHERE upid = s.upid), 0) = ` +
+        `${opts.machine}`,
+    );
+  }
+  const where = conds.join(' AND ');
+  const res = await engine.query(`
+    INCLUDE PERFETTO MODULE slices.with_context;
+    WITH leaf AS (
+      SELECT s.name AS kernel, s.dur, s.ts
+      FROM thread_or_process_slice s
+      WHERE ${where}
+        AND NOT EXISTS (SELECT 1 FROM slice c WHERE c.parent_id = s.id)
+    )
+    SELECT
+      kernel,
+      count(*) AS cnt,
+      CAST(sum(dur) / 1e3 AS REAL) AS total_us,
+      CAST(avg(dur) / 1e3 AS REAL) AS avg_us,
+      min(ts) AS first_ts
+    FROM leaf
+    GROUP BY kernel
+    ORDER BY first_ts
+    LIMIT ${opts.limit}
+  `);
+  const out: KernelListRow[] = [];
+  const it = res.iter({});
+  for (; it.valid(); it.next()) {
+    out.push({
+      kernel: String(it.get('kernel') ?? ''),
+      count: Number(it.get('cnt')),
+      totalUs: Number(it.get('total_us')),
+      avgUs: Number(it.get('avg_us')),
+      firstTs: Number(it.get('first_ts')),
+    });
+  }
+  return out;
+}
+
+// Fetches a vLLM model definition from GitHub and extracts a compact structure
+// summary (class hierarchy, __init__ submodule wiring, forward() call order) to
+// help the model map kernels onto the architecture. Returns the raw text plus
+// the resolved file path. Throws with a helpful message (incl. close matches)
+// when the model file isn't found.
+const VLLM_MODELS_DIR =
+  'https://raw.githubusercontent.com/vllm-project/vllm/main/' +
+  'vllm/model_executor/models';
+const VLLM_MODELS_API =
+  'https://api.github.com/repos/vllm-project/vllm/contents/' +
+  'vllm/model_executor/models';
+
+// Lists the available vLLM model file base names (e.g. 'deepseek_v2',
+// 'qwen3_moe') from the repo, so the model can match the user's free-form
+// model name against the real list before fetching a specific one. Cached for
+// the session to avoid hammering the GitHub API (rate limit 60/h unauth).
+let cachedVllmModels: string[] | undefined;
+async function listVllmModels(): Promise<string[]> {
+  if (cachedVllmModels !== undefined) return cachedVllmModels;
+  const resp = await fetch(VLLM_MODELS_API);
+  if (!resp.ok) {
+    throw new Error(`Could not list vLLM models (HTTP ${resp.status}).`);
+  }
+  const items = (await resp.json()) as ReadonlyArray<{name?: string}>;
+  const names = items
+    .map((i) => i.name ?? '')
+    .filter((n) => n.endsWith('.py') && n !== '__init__.py')
+    .map((n) => n.replace(/\.py$/, ''))
+    .sort((a, b) => a.localeCompare(b));
+  cachedVllmModels = names;
+  return names;
+}
+
+async function fetchModelStructure(
+  modelName: string,
+): Promise<{file: string; summary: string}> {
+  // Normalise: accept "deepseek_v2", "deepseek_v2.py", or "DeepseekV2".
+  const base = modelName
+    .trim()
+    .replace(/\.py$/i, '')
+    .replace(/[^A-Za-z0-9_]/g, '');
+  if (base === '') throw new Error('model_name is required.');
+  const url = `${VLLM_MODELS_DIR}/${base}.py`;
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    // 404 (or other): list the directory and suggest close matches by name so
+    // the caller (or the model) can pick the right file and retry.
+    let hint = '';
+    try {
+      const names = await listVllmModels();
+      const needle = base.toLowerCase();
+      const close = names
+        .filter(
+          (n) =>
+            n.toLowerCase().includes(needle) ||
+            needle.includes(n.toLowerCase()),
+        )
+        .slice(0, 20);
+      hint =
+        close.length > 0
+          ? ` Did you mean one of: ${close.join(', ')}? ` +
+            'Call list_vllm_models to see all options.'
+          : ` Call list_vllm_models to see the ${names.length} available ` +
+            'model files and pick the exact name.';
+    } catch {
+      // Directory listing is best-effort.
+    }
+    throw new Error(
+      `No vLLM model file "${base}.py" (HTTP ${resp.status}).${hint}`,
+    );
+  }
+  const src = await resp.text();
+  return {file: `${base}.py`, summary: summariseModelSource(src)};
+}
+
+// Extracts a compact architecture summary from a vLLM model .py source: each
+// class, the submodules it wires up in __init__ (self.x = SomeModule(...)), and
+// the order of calls in its forward(). This gives the LLM the module hierarchy
+// and execution order without dumping the whole file.
+function summariseModelSource(src: string): string {
+  const lines = src.split('\n');
+  const out: string[] = [];
+  let curClass: string | undefined;
+  let inForward = false;
+  let forwardIndent = 0;
+  let forwardCalls: string[] = [];
+
+  const flushForward = () => {
+    if (curClass !== undefined && forwardCalls.length > 0) {
+      out.push(`  forward: ${forwardCalls.join(' → ')}`);
+    }
+    forwardCalls = [];
+    inForward = false;
+  };
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '');
+    const classM = /^class\s+([A-Za-z0-9_]+)\s*(\([^)]*\))?\s*:/.exec(line);
+    if (classM !== undefined && classM !== null) {
+      flushForward();
+      curClass = classM[1];
+      const bases = classM[2] ?? '';
+      out.push(`class ${curClass}${bases}`);
+      continue;
+    }
+    if (curClass === undefined) continue;
+
+    // __init__ submodule wiring: self.<name> = <Module>(...)
+    const initM = /^\s+self\.([A-Za-z0-9_]+)\s*=\s*([A-Za-z0-9_.]+)\s*\(/.exec(
+      line,
+    );
+    if (initM !== null && !inForward) {
+      out.push(`  self.${initM[1]} = ${initM[2]}(…)`);
+      continue;
+    }
+
+    const fwdM = /^(\s+)def\s+forward\s*\(/.exec(line);
+    if (fwdM !== null) {
+      flushForward();
+      inForward = true;
+      forwardIndent = fwdM[1].length;
+      continue;
+    }
+    if (inForward) {
+      // Leaving forward() when indentation drops back to def level or less.
+      const indent = line.length - line.trimStart().length;
+      if (line.trim() !== '' && indent <= forwardIndent) {
+        flushForward();
+      } else {
+        // Record self.<x>( and bare <module>( calls in body order.
+        const callM = /(?:self\.)?([A-Za-z0-9_]+)\s*\(/.exec(line.trim());
+        if (callM !== null) {
+          const name = callM[1];
+          if (
+            ![
+              'forward',
+              'super',
+              'len',
+              'range',
+              'getattr',
+              'isinstance',
+              'enumerate',
+              'zip',
+            ].includes(name)
+          ) {
+            forwardCalls.push(name);
+          }
+        }
+      }
+    }
+  }
+  flushForward();
+  const text = out.join('\n');
+  return text.length > MAX_STRUCTURE_CHARS
+    ? `${text.slice(0, MAX_STRUCTURE_CHARS)}\n…[truncated]`
+    : text;
 }
 
 // Builds the tool set for a trace. `alignment` lets the diff tools report
@@ -777,7 +1011,192 @@ export function buildTools(
     },
   };
 
-  return [runSql, listTraces, compareSlices, kernelBreakdown, exportData];
+  // ---- Distinct-kernel list (for model-structure classification) ----------
+
+  const listKernelsTool: Tool = {
+    def: {
+      type: 'function',
+      function: {
+        name: LIST_KERNELS,
+        description:
+          'List the DISTINCT leaf kernels in the current selection (or the ' +
+          'given window/tracks), ordered by first appearance (execution ' +
+          'order). Each row: kernel (leaf slice name), count, totalUs, avgUs, ' +
+          'firstTs. This is the small, deduped kernel inventory you classify ' +
+          'BY NAME against the model architecture (see fetch_model_structure) ' +
+          'into module/stage, then feed those exact names as kernel_cost_' +
+          'breakdown `groups` rules (pattern = the exact kernel name) so the ' +
+          'aggregation is deterministic and complete — never hand-classify ' +
+          'inside SQL. Defaults to the user selection; omit ' +
+          'track_ids/start_ts/end_ts to use it.',
+        parameters: {
+          type: 'object',
+          properties: {
+            track_ids: {
+              type: 'array',
+              items: {type: 'number'},
+              description: 'Restrict to these track_ids (default: selection).',
+            },
+            start_ts: {type: 'number', description: 'Window start (trace ns).'},
+            end_ts: {type: 'number', description: 'Window end (trace ns).'},
+            machine_id: {
+              type: 'number',
+              description: 'Restrict to one loaded trace.',
+            },
+            limit: {
+              type: 'number',
+              description: `Max distinct kernels (default 500, max ${MAX_ROWS}).`,
+            },
+          },
+        },
+      },
+    },
+    async run(args: Record<string, unknown>): Promise<ToolHandlerResult> {
+      const num = (v: unknown): number | undefined => {
+        if (v === undefined || v === null || v === '') return undefined;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : undefined;
+      };
+      let startTs = num(args.start_ts);
+      let endTs = num(args.end_ts);
+      let trackIds: ReadonlyArray<number> | undefined = Array.isArray(
+        args.track_ids,
+      )
+        ? (args.track_ids as unknown[])
+            .map((v) => Number(v))
+            .filter((n) => Number.isFinite(n))
+        : undefined;
+      const overrodeWindow = startTs !== undefined && endTs !== undefined;
+      const overrodeTracks = trackIds !== undefined && trackIds.length > 0;
+      const sel = selectionProvider?.();
+      if (sel !== undefined && !overrodeWindow && !overrodeTracks) {
+        startTs = sel.startTs ?? startTs;
+        endTs = sel.endTs ?? endTs;
+        trackIds = sel.trackIds.length > 0 ? sel.trackIds : trackIds;
+      }
+      const haveWindow = startTs !== undefined && endTs !== undefined;
+      const rows = await listKernels(engine, {
+        startTs: haveWindow ? startTs : undefined,
+        endTs: haveWindow ? endTs : undefined,
+        machine: num(args.machine_id),
+        trackIds,
+        limit: Math.min(num(args.limit) ?? 500, MAX_ROWS),
+      });
+      return {
+        content: JSON.stringify(rows),
+        summary: `list_kernels → ${rows.length} distinct kernel${
+          rows.length === 1 ? '' : 's'
+        }`,
+      };
+    },
+  };
+
+  // ---- Model structure (vLLM) ---------------------------------------------
+
+  const listModelsTool: Tool = {
+    def: {
+      type: 'function',
+      function: {
+        name: LIST_MODELS,
+        description:
+          'List the available model file base names in the vLLM repo ' +
+          '(vllm/model_executor/models), e.g. "deepseek_v2", "qwen3_moe", ' +
+          '"llama4". Call this FIRST when you need a model structure: get the ' +
+          'real list, then match the user-supplied model name against it ' +
+          '(handle aliases / casing / version differences yourself — e.g. ' +
+          '"DeepSeek-V3" -> "deepseek_v3", "qwen3 moe" -> "qwen3_moe") and ' +
+          'pick the closest existing file, before calling ' +
+          'fetch_model_structure with that exact base name. If nothing ' +
+          'plausibly matches, ask the user.',
+        parameters: {type: 'object', properties: {}},
+      },
+    },
+    async run(): Promise<ToolHandlerResult> {
+      try {
+        const names = await listVllmModels();
+        return {
+          content: JSON.stringify(names),
+          summary: `list_vllm_models → ${names.length} models`,
+        };
+      } catch (e: unknown) {
+        return {content: `Error: ${String(e)}`, summary: 'list models failed'};
+      }
+    },
+  };
+
+  const modelStructureTool: Tool = {
+    def: {
+      type: 'function',
+      function: {
+        name: MODEL_STRUCTURE,
+        description:
+          'Fetch a model architecture from the vLLM repo ' +
+          '(vllm/model_executor/models) and return a compact structure ' +
+          'summary: class hierarchy, the submodules each class wires up, and ' +
+          'the forward() call order. Use this to classify kernels by MODEL ' +
+          'STRUCTURE (which layer/module each kernel belongs to) instead of ' +
+          'guessing from names. model_name must be an EXACT file base name ' +
+          "from list_vllm_models (call that first and match the user's name " +
+          'against the real list — do not guess a name blindly). On a wrong ' +
+          'name the tool suggests close matches.',
+        parameters: {
+          type: 'object',
+          properties: {
+            model_name: {
+              type: 'string',
+              description:
+                'Exact vLLM model file base name from list_vllm_models, ' +
+                'e.g. "deepseek_v2", "qwen3_moe".',
+            },
+          },
+          required: ['model_name'],
+        },
+      },
+    },
+    async run(args: Record<string, unknown>): Promise<ToolHandlerResult> {
+      const name = String(args.model_name ?? '').trim();
+      if (name === '') {
+        return {
+          content:
+            'Error: model_name is required. If you do not know which model ' +
+            'this trace is, ask the user.',
+          summary: MODEL_STRUCTURE,
+        };
+      }
+      try {
+        const {file, summary} = await fetchModelStructure(name);
+        return {
+          content: `Model structure from vLLM ${file}:\n\n${summary}`,
+          summary: `model structure: ${file}`,
+        };
+      } catch (e: unknown) {
+        return {
+          content: `Error: ${String(e)}`,
+          summary: `model structure not found`,
+        };
+      }
+    },
+  };
+
+  return [
+    runSql,
+    listTraces,
+    compareSlices,
+    listKernelsTool,
+    listModelsTool,
+    modelStructureTool,
+    kernelBreakdown,
+    exportData,
+  ];
 }
 
-export {RUN_SQL, LIST_TRACES, COMPARE_SLICES, KERNEL_BREAKDOWN, EXPORT_DATA};
+export {
+  RUN_SQL,
+  LIST_TRACES,
+  COMPARE_SLICES,
+  KERNEL_BREAKDOWN,
+  LIST_KERNELS,
+  LIST_MODELS,
+  MODEL_STRUCTURE,
+  EXPORT_DATA,
+};

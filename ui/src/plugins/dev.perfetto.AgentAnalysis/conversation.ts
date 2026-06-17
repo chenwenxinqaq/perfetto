@@ -136,6 +136,16 @@ export class Conversation {
     this.abort?.abort();
   }
 
+  // Stops an in-flight agent run (the user pressed Stop). Aborts the current
+  // request/tool loop and clears the loading state so the composer is usable
+  // again; the partial assistant turn (if any) is kept.
+  stop(): void {
+    if (!this.isLoading) return;
+    this.abort?.abort();
+    this.isLoading = false;
+    m.redraw();
+  }
+
   // ---- History (persisted per-trace) -------------------------------------
 
   history(): SavedConversation[] {
@@ -261,6 +271,7 @@ export class Conversation {
       // Agentic loop: stream a turn; if the model asked for tools, run them,
       // feed results back, and continue. Stop when a turn has no tool calls.
       for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        if (signal.aborted) break; // User pressed Stop between rounds.
         logger.incRounds();
         let toolCalls: ReadonlyArray<{
           id: string;
@@ -292,6 +303,7 @@ export class Conversation {
           toolCalls,
         });
         for (const call of toolCalls) {
+          if (signal.aborted) break; // User pressed Stop mid tool-loop.
           const tool = toolByName.get(call.name);
           let resultContent: string;
           let note: string;
